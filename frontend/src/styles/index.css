@@ -1,0 +1,105 @@
+/* ones-AI 平台全局样式 — 暗色主题 */
+:root {
+  --bg-primary: #0a0e1a;
+  --bg-secondary: #111827;
+  --bg-card: #1a1f36;
+  --bg-card-hover: #232942;
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --accent-blue: #6366f1;
+  --accent-purple: #8b5cf6;
+  --accent-gradient: linear-gradient(135deg, #6366f1, #8b5cf6);
+  --success: #10b981;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --border-color: rgba(99, 102, 241, 0.15);
+  --glass-bg: rgba(26, 31, 54, 0.8);
+  --glass-border: rgba(99, 102, 241, 0.2);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  --font: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app { min-height: 100vh; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 3px; }
+
+/* Element Plus 暗色覆盖 */
+.el-card { --el-card-bg-color: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius) !important; }
+.el-button--primary { background: var(--accent-gradient) !important; border: none !important; }
+.el-input__wrapper { background: var(--bg-secondary) !important; box-shadow: 0 0 0 1px var(--border-color) inset !important; }
+.el-menu { background: var(--bg-secondary) !important; border: none !important; }
+.el-dialog { --el-dialog-bg-color: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius) !important; }
+
+/* 通用类 */
+.page-container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 24px;
+  box-shadow: var(--shadow);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.glass-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+.stat-number {
+  font-size: 2.5rem;
+  font-weight: 700;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.stat-label {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 20px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.badge-success { background: rgba(16,185,129,0.15); color: var(--success); }
+.badge-danger { background: rgba(239,68,68,0.15); color: var(--danger); }
+.badge-warning { background: rgba(245,158,11,0.15); color: var(--warning); }
+.badge-info { background: rgba(99,102,241,0.15); color: var(--accent-blue); }
+
+/* 动画 */
+@keyframes fadeInUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+.fade-in-up { animation: fadeInUp 0.4s ease-out; }
+
+/* 布局 */
+.app-layout { display: flex; min-height: 100vh; }
+.app-sidebar { width: 240px; background: var(--bg-secondary); border-right: 1px solid var(--border-color); padding: 20px 0; position: fixed; top: 0; left: 0; bottom: 0; z-index: 10; }
+.app-main { flex: 1; margin-left: 240px; padding: 24px 32px; }
+.sidebar-logo { padding: 0 20px 24px; font-size: 1.3rem; font-weight: 700; background: var(--accent-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border-color); }
+.sidebar-logo img { width: 28px; height: 28px; }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 20px; color: var(--text-secondary); cursor: pointer; transition: all 0.2s; font-size: 0.9rem; text-decoration: none; }
+.nav-item:hover { color: var(--text-primary); background: rgba(99,102,241,0.08); }
+.nav-item.active { color: var(--accent-blue); background: rgba(99,102,241,0.12); border-right: 3px solid var(--accent-blue); }
+.nav-section { padding: 16px 20px 6px; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); }
+
+/* 日志查看器 */
+.log-viewer { background: #0d1117; border-radius: var(--radius-sm); padding: 12px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.82rem; line-height: 1.6; color: #c9d1d9; overflow-y: auto; max-height: 500px; white-space: pre-wrap; word-break: break-all; }

@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:16-alpine
+    container_name: onesai-db
+    environment:
+      POSTGRES_USER: onesai
+      POSTGRES_PASSWORD: onesai123
+      POSTGRES_DB: ones_ai_platform
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # 后端 FastAPI
+  backend:
+    build: ./backend
+    container_name: onesai-backend
+    ports:
+      - "9610:9610"
+    env_file: .env
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+
+  # 前端 Nginx
+  frontend:
+    build: ./frontend
+    container_name: onesai-frontend
+    ports:
+      - "9611:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
