@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+.venv
+.env
+.git
+test_imports.py
+review_check.py
+review_results.txt
