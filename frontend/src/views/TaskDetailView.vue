@@ -91,7 +91,11 @@ function statusLabel(s) {
   return { pending:'排队中', running:'执行中', completed:'已完成', failed:'失败', cancelled:'已取消' }[s] || s
 }
 function renderMd(text) {
-  try { return window.marked?.parse(text) || text } catch { return text }
+  // 安全化: 先移除 script/iframe/onclick 等危险内容
+  const safe = text.replace(/<script[\s\S]*?<\/script>/gi, '')
+                    .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
+                    .replace(/on\w+\s*=\s*["'][^"']*["']/gi, '')
+  try { return window.marked?.parse(safe) || safe } catch { return safe }
 }
 
 async function loadTask() {

@@ -117,10 +117,22 @@ async def login(req: LoginRequest):
     3. 生成 JWT 返回
     """
     # 1. ONES 验证
+    ones_user = None
     try:
         ones_user = await verify_ones_login(req.email, req.password)
     except OnesClientError as e:
-        raise HTTPException(status_code=401, detail=f"登录失败: {e.message}")
+        if settings.DEBUG:
+            # 开发模式: ONES API 不通时允许跳过验证
+            logger.warning(f"[DEV] ONES 验证失败({e.message})，开发模式允许跳过")
+            ones_user = {"name": req.email.split("@")[0], "uuid": "dev-mode"}
+        else:
+            raise HTTPException(status_code=401, detail=f"登录失败: {e.message}")
+    except Exception as e:
+        if settings.DEBUG:
+            logger.warning(f"[DEV] ONES API 连接失败({e})，开发模式允许跳过")
+            ones_user = {"name": req.email.split("@")[0], "uuid": "dev-mode"}
+        else:
+            raise HTTPException(status_code=401, detail=f"登录失败: ONES 服务不可用")
 
     # 2. 查找或创建本地用户
     pool = await get_pool()

@@ -87,6 +87,13 @@ def _build_remote_command(tickets: list[dict]) -> str:
     for t in tickets:
         cmd_parts.append(t["ticket_id"])
 
+    # 添加代码位置（必填）
+    code_dirs = [t.get("code_directory", "") for t in tickets]
+    if any(d for d in code_dirs):
+        cmd_parts.append("--code-dirs")
+        for d in code_dirs:
+            cmd_parts.append(d if d else '""')
+
     # 添加补充说明（可选）
     notes = [t.get("note", "") for t in tickets]
     if any(n for n in notes):
@@ -165,7 +172,7 @@ async def _execute_task(task_id: int):
             return
 
         # 构建远程命令
-        ticket_data = [{"ticket_id": t["ticket_id"], "note": t["note"] or ""} for t in tickets]
+        ticket_data = [{"ticket_id": t["ticket_id"], "note": t["note"] or "", "code_directory": t["code_directory"] or ""} for t in tickets]
         command = _build_remote_command(ticket_data)
         await _save_log(task_id, f"执行命令: {command}", "system")
 

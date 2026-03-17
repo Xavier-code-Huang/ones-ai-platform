@@ -52,12 +52,22 @@
     </div>
 
     <!-- 凭证验证弹窗 -->
-    <el-dialog v-model="verifyDialog" title="验证服务器凭证" width="420px" :close-on-click-modal="false" id="verify-dialog">
-      <p style="color:var(--text-secondary);margin-bottom:16px;">请输入 {{ verifyServer?.name }} 的 SSH 账号：</p>
-      <el-form :model="credForm">
-        <el-form-item label="用户名"><el-input v-model="credForm.ssh_username" id="cred-username" /></el-form-item>
-        <el-form-item label="密  码"><el-input v-model="credForm.ssh_password" type="password" show-password id="cred-password" /></el-form-item>
-        <el-form-item label="别  名"><el-input v-model="credForm.alias" placeholder="可选，便于区分多组凭证" /></el-form-item>
+    <el-dialog v-model="verifyDialog" title="验证服务器凭证" width="440px" :close-on-click-modal="false" id="verify-dialog">
+      <p style="color:var(--text-secondary);margin-bottom:20px;font-size:0.9rem;">
+        请输入 <strong style="color:var(--text-primary);">{{ verifyServer?.name }}</strong> 的 SSH 登录凭证
+      </p>
+      <el-form :model="credForm" label-width="80px" label-position="left" autocomplete="off">
+        <el-form-item label="用户名">
+          <el-input v-model="credForm.ssh_username" placeholder="SSH 用户名" id="cred-username"
+                    autocomplete="off" name="ssh-user-new" />
+        </el-form-item>
+        <el-form-item label="密码">
+          <el-input v-model="credForm.ssh_password" type="password" placeholder="SSH 密码"
+                    show-password id="cred-password" autocomplete="new-password" name="ssh-pass-new" />
+        </el-form-item>
+        <el-form-item label="别名">
+          <el-input v-model="credForm.alias" placeholder="可选，便于区分多组凭证" autocomplete="off" />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="verifyDialog=false">取消</el-button>
@@ -88,7 +98,7 @@ onMounted(async () => {
     servers.value = await api.getServers()
     const data = await api.getTasks({ page: 1, page_size: 10 })
     tasks.value = data
-  } catch {}
+  } catch (e) { console.warn('Dashboard 数据加载失败:', e) }
 })
 
 function statusColor(s) {
