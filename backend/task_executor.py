@@ -78,12 +78,18 @@ async def _save_log(task_id: int, content: str, log_type: str = "stdout",
         """, task_id, ticket_id, log_type, content)
 
 
-def _build_remote_command(tickets: list[dict]) -> str:
-    """构建发送到远程服务器的 ones_task_runner 命令"""
-    runner_path = "/opt/lango/ones_task_runner/ones_task_runner.py"
+def _build_remote_command(tickets: list[dict], agent_dir: str = "",
+                          extra_mounts: list[str] = None,
+                          task_mode: str = "fix") -> str:
+    """构建发送到远程服务器的 ones-AI 命令
 
-    # 检查是否有二进制版本
-    cmd_parts = ["python3", runner_path, "--json-output", "--tickets"]
+    通过 ones-AI 脚本执行（走 Docker 容器），和命令行方式完全一致，
+    避免宿主机 Python 版本、依赖等环境不一致问题。
+    工作目录设为用户家目录（每个用户的 process/ 日志隔离）。
+    """
+    # ones-AI 已安装在 PATH 中（如 /usr/local/bin/ones-AI）
+    cmd_parts = ["ones-AI", "--json-output", "--tickets"]
+
     for t in tickets:
         cmd_parts.append(t["ticket_id"])
 
@@ -101,7 +107,23 @@ def _build_remote_command(tickets: list[dict]) -> str:
         for n in notes:
             cmd_parts.append(n if n else '""')
 
-    return " ".join(shlex.quote(p) for p in cmd_parts)
+    # 添加 Agent Teams 目录（必填）
+    if agent_dir:
+        cmd_parts.extend(["--agent-dir", agent_dir])
+
+    # 添加额外挂载路径（可选，逗号分隔）
+    if extra_mounts:
+        cmd_parts.extend(["--extra-mounts", ",".join(extra_mounts)])
+
+    # 添加任务模式
+    if task_mode:
+        cmd_parts.extend(["--task-mode", task_mode])
+
+    cmd = " ".join(shlex.quote(p) for p in cmd_parts)
+
+    # cd 到用户家目录（确保 process/ 日志按用户隔离）
+    # 设置 UTF-8 locale 避免 ones-AI 脚本中 printf '%q' 破坏中文
+    return f"export LANG=C.UTF-8 LC_ALL=C.UTF-8 && cd ~ && {cmd}"
 
 
 async def _execute_task(task_id: int):
@@ -172,8 +194,21 @@ async def _execute_task(task_id: int):
             return
 
         # 构建远程命令
-        ticket_data = [{"ticket_id": t["ticket_id"], "note": t["note"] or "", "code_directory": t["code_directory"] or ""} for t in tickets]
-        command = _build_remote_command(ticket_data)
+        ticket_data = [{"ticket_id": t["ticket_id"], "note": t["note"] or "",
+                        "code_directory": t["code_directory"] or ""} for t in tickets]
+        # 收集所有额外挂载路径（去重）
+        all_extra_mounts = set()
+        for t in tickets:
+            mounts_str = t.get("extra_mounts") or ""
+            if mounts_str:
+                for m in mounts_str.split(','):
+                    if m.strip():
+                        all_extra_mounts.add(m.strip())
+        agent_dir = task.get("agent_dir") or ""
+        task_mode = task.get("task_mode") or "fix"
+        command = _build_remote_command(ticket_data, agent_dir=agent_dir,
+                                        extra_mounts=list(all_extra_mounts) if all_extra_mounts else None,
+                                        task_mode=task_mode)
         await _save_log(task_id, f"执行命令: {command}", "system")
 
         # 执行远程命令
@@ -210,23 +245,54 @@ async def _execute_task(task_id: int):
                         ticket_status = result.get("status", "failed")
                         duration = result.get("duration", 0)
                         summary = result.get("summary", "")
+                        # 新增结构化字段（兼容旧版 Runner）
+                        title = result.get("title", "")
+                        conclusion = result.get("conclusion", "")
+                        analysis = result.get("analysis", "")
+                        report_path = result.get("report_path", "")
 
-                        # 更新工单状态
+                        # [FR-018] analysis 独立存储到 result_analysis 列，不再混入 summary
+
+                        # 更新工单状态（含新字段）
                         async with pool.acquire() as conn:
                             await conn.execute("""
                                 UPDATE task_tickets SET
                                     status=$1, result_summary=$2, duration=$3,
+                                    ticket_title=$4, result_conclusion=$5,
+                                    report_path=$6, result_analysis=$7,
                                     completed_at=NOW()
-                                WHERE task_id=$4 AND ticket_id=$5
+                                WHERE task_id=$8 AND ticket_id=$9
                             """, "completed" if ticket_status == "success" else "failed",
-                                summary, duration, task_id, ticket_id_str)
+                                summary, duration, title, conclusion,
+                                report_path, analysis, task_id, ticket_id_str)
 
                         if ticket_status == "success":
                             success_count += 1
                         else:
                             failed_count += 1
+
+                        # [FR-019] JSON 结果行已结构化存入 task_tickets，日志中写可读摘要
+                        status_emoji = "\u2705" if ticket_status == "success" else "\u274c"
+                        readable_log = f"{status_emoji} \u4efb\u52a1{ticket_status}: {ticket_id_str} (\u8017\u65f6 {duration:.1f}s)"
+                        await _save_log(task_id, readable_log, "system")
+                        await _broadcast_log(task_id, {
+                            "type": "log", "content": readable_log,
+                            "log_type": "system",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        # 广播进度更新（触发前端实时刷新工单结果区）
+                        await _broadcast_log(task_id, {
+                            "type": "progress",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
                     except json.JSONDecodeError:
-                        pass
+                        # JSON 解析失败，将原始行作为普通日志保存
+                        await _save_log(task_id, line, "stdout")
+                        await _broadcast_log(task_id, {
+                            "type": "log", "content": line,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                    continue  # 跳过后面的通用日志保存
 
                 # 保存和广播日志
                 await _save_log(task_id, line, "stdout")
@@ -236,11 +302,15 @@ async def _execute_task(task_id: int):
                 })
 
             # 读取 stderr
-            stderr = process.stderr.read() if process.stderr else ""
-            if stderr:
-                await _save_log(task_id, str(stderr), "stderr")
+            if process.stderr:
+                stderr = await process.stderr.read()
+                if stderr:
+                    await _save_log(task_id, stderr.strip(), "stderr")
 
             await process.wait()
+
+            # 下载工单报告（1.md）
+            await _download_reports(ssh_conn, pool, task_id)
 
         except Exception as e:
             error_msg = f"执行异常: {e}"
@@ -284,6 +354,39 @@ async def _execute_task(task_id: int):
                 "UPDATE tasks SET status='failed', completed_at=NOW() WHERE id=$1",
                 task_id,
             )
+
+
+async def _download_reports(ssh_conn, pool, task_id: int):
+    """通过 SSH 下载各工单的 1.md 报告文件，存入 result_report 列"""
+    try:
+        async with pool.acquire() as conn:
+            tickets = await conn.fetch(
+                "SELECT ticket_id, report_path FROM task_tickets "
+                "WHERE task_id=$1 AND report_path != '' AND report_path IS NOT NULL",
+                task_id,
+            )
+        for t in tickets:
+            report_path = t["report_path"]
+            try:
+                proc = await ssh_conn.create_process(
+                    f"cat {report_path} 2>/dev/null"
+                )
+                report_content = ""
+                async for rline in proc.stdout:
+                    report_content += rline
+                await proc.wait()
+                if report_content.strip():
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE task_tickets SET result_report=$1 "
+                            "WHERE task_id=$2 AND ticket_id=$3",
+                            report_content.strip(), task_id, t["ticket_id"],
+                        )
+                    logger.info(f"已下载报告: {report_path} (ticket={t['ticket_id']})")
+            except Exception as e:
+                logger.warning(f"下载报告失败 {report_path}: {e}")
+    except Exception as e:
+        logger.warning(f"报告下载阶段异常: {e}")
 
 
 async def task_worker():

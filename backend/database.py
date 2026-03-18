@@ -120,6 +120,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     success_count   INTEGER DEFAULT 0,
     failed_count    INTEGER DEFAULT 0,
     total_duration  REAL DEFAULT 0,
+    agent_dir       TEXT DEFAULT '',
+    task_mode       TEXT DEFAULT 'fix',
     submitted_at    TIMESTAMP DEFAULT NOW(),
     started_at      TIMESTAMP,
     completed_at    TIMESTAMP,
@@ -140,12 +142,17 @@ CREATE TABLE IF NOT EXISTS task_tickets (
     ticket_id       VARCHAR(50) NOT NULL,
     note            TEXT DEFAULT '',
     code_directory  TEXT DEFAULT '',
+    extra_mounts    TEXT DEFAULT '',
     compile_command TEXT DEFAULT '',
     run_tests       BOOLEAN DEFAULT FALSE,
     status          VARCHAR(20) DEFAULT 'pending',
     result_summary  TEXT DEFAULT '',
     result_report   TEXT DEFAULT '',
     error_message   TEXT DEFAULT '',
+    ticket_title    TEXT DEFAULT '',
+    result_conclusion TEXT DEFAULT '',
+    report_path     TEXT DEFAULT '',
+    result_analysis TEXT DEFAULT '',
     duration        REAL DEFAULT 0,
     started_at      TIMESTAMP,
     completed_at    TIMESTAMP,
@@ -224,9 +231,20 @@ ON CONFLICT (ones_email) DO NOTHING;
 """
 
 
+# 数据库迁移：为已有表新增列（兼容旧版本）
+MIGRATION_SQL = """
+ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS ticket_title TEXT DEFAULT '';
+ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS result_conclusion TEXT DEFAULT '';
+ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS report_path TEXT DEFAULT '';
+ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS result_analysis TEXT DEFAULT '';
+"""
+
+
 async def init_db():
     """初始化数据库表结构"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(INIT_SQL)
-    logger.info("数据库初始化完成（8 张表）")
+        # 执行迁移（新增列，兼容已有表）
+        await conn.execute(MIGRATION_SQL)
+    logger.info("数据库初始化完成（8 张表 + 迁移）")

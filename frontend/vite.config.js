@@ -17,4 +17,20 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Element Plus 单独打包（最大的依赖）
+          'element-plus': ['element-plus', '@element-plus/icons-vue'],
+          // Vue 核心单独打包（浏览器缓存友好）
+          'vue-vendor': ['vue', 'vue-router', 'pinia'],
+        },
+      },
+    },
+    // 启用 CSS 代码分割
+    cssCodeSplit: true,
+    // chunk 大小警告阈值
+    chunkSizeWarningLimit: 800,
+  },
 })

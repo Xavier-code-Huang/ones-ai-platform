@@ -38,6 +38,9 @@ export default {
   getTasks: (params) => api.get('/tasks', { params }),
   getTask: (id) => api.get(`/tasks/${id}`),
   cancelTask: (id) => api.delete(`/tasks/${id}`),
+  getTaskLogs: (id) => api.get(`/tasks/${id}/logs`),
+  getTicketReport: (taskId, ticketId) => api.get(`/tasks/${taskId}/tickets/${ticketId}/report`),
+  reworkTicket: (taskId, ticketId, data) => api.post(`/tasks/${taskId}/tickets/${ticketId}/rework`, data),
   // Evaluations
   submitEval: (data) => api.post('/evaluations', data),
   // Admin
@@ -45,6 +48,7 @@ export default {
   getTrends: (days, granularity) => api.get('/admin/trends', { params: { days, granularity } }),
   getUserRankings: (days) => api.get('/admin/users', { params: { days } }),
   getUserDetail: (userId, days) => api.get(`/admin/users/${userId}/detail`, { params: { days } }),
+  getUserTrends: (userId, days, granularity) => api.get(`/admin/users/${userId}/trends`, { params: { days, granularity } }),
   getEvalStats: (days) => api.get('/admin/evaluations/stats', { params: { days } }),
   getConfigs: () => api.get('/admin/configs'),
   updateConfigs: (configs) => api.post('/admin/configs', { configs }),
