@@ -137,6 +137,71 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
         if not cred:
             raise HTTPException(status_code=400, detail="凭证不存在或未验证")
 
+        # ---- SSH 路径预校验 ----
+        try:
+            from crypto import decrypt_password
+            from ssh_pool import get_ssh_connection
+
+            ssh_password = decrypt_password(cred["ssh_password_encrypted"])
+            ssh_conn = await get_ssh_connection(
+                cred["host"], cred["ssh_port"],
+                cred["ssh_username"], ssh_password,
+            )
+
+            # 收集所有需要检查的路径
+            paths_to_check = [req.agent_dir]
+            for t in req.tickets:
+                if t.code_directory:
+                    paths_to_check.append(t.code_directory)
+                for mp in t.extra_mounts:
+                    if mp and mp.strip():
+                        paths_to_check.append(mp.strip())
+
+            # 去重
+            paths_to_check = list(dict.fromkeys(paths_to_check))
+
+            # 构建一条 shell 命令批量检查所有路径
+            # 输出格式: path|EXISTS 或 path|MISSING
+            check_parts = []
+            for p in paths_to_check:
+                safe_p = p.replace("'", "'\\''")
+                check_parts.append(f"if [ -d '{safe_p}' ]; then echo '{safe_p}|EXISTS'; else echo '{safe_p}|MISSING'; fi")
+            check_cmd = " && ".join(check_parts)
+
+            import asyncio
+            proc = await ssh_conn.create_process(check_cmd)
+            proc.stdin.write_eof()
+            output = ""
+            async for line in proc.stdout:
+                output += line
+            await asyncio.wait_for(proc.wait(), timeout=15)
+
+            missing_paths = []
+            for line in output.strip().split('\n'):
+                if '|MISSING' in line:
+                    missing_path = line.split('|')[0]
+                    missing_paths.append(missing_path)
+
+            if missing_paths:
+                detail_parts = []
+                for mp in missing_paths:
+                    if mp == req.agent_dir:
+                        detail_parts.append(f"Agent 目录不存在: {mp}")
+                    else:
+                        detail_parts.append(f"路径不存在: {mp}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="以下路径在服务器 {} 上不存在:\n{}".format(
+                        cred['host'], "\n".join(detail_parts)
+                    )
+                )
+
+        except HTTPException:
+            raise  # 重新抛出我们自己的异常
+        except Exception as e:
+            # SSH 连接失败等情况，记录日志但不阻止提交（路径可能确实存在）
+            logger.warning(f"SSH 路径预校验失败 (server={cred['host']}): {e}")
+
         # 收集所有额外挂载路径（去重）
         all_extra_mounts = set()
         for t in req.tickets:

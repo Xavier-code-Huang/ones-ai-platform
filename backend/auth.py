@@ -145,10 +145,14 @@ async def login(req: LoginRequest):
             user_id = row["id"]
             display_name = row["display_name"] or ones_user.get("name", "")
             role = row["role"]
-            # 更新 display_name 和 last_login
+            # 更新 display_name（仅当 ONES 返回了有效中文名时）和 last_login
+            ones_name = ones_user.get("name", "")
+            # DEBUG 模式的假名字（如 "yixiang.huang"）不应覆盖数据库中已有的中文名
+            update_name = ones_name if (ones_name and ones_name != "dev-mode"
+                                        and not ones_name.endswith(req.email.split("@")[0])) else display_name
             await conn.execute(
                 "UPDATE users SET display_name=$1, last_login_at=NOW(), updated_at=NOW() WHERE id=$2",
-                ones_user.get("name", display_name),
+                update_name or display_name,
                 user_id,
             )
         else:

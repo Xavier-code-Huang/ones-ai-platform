@@ -123,7 +123,7 @@
         <!-- AI 结论 -->
         <div v-if="t.result_conclusion" class="conclusion-bar">
           <span class="conclusion-label">🤖 AI 结论</span>
-          {{ t.result_conclusion }}
+          <span v-html="renderMd(t.result_conclusion)"></span>
         </div>
 
         <!-- [FR-020] AI 处理详情（折叠区域） -->
@@ -140,9 +140,7 @@
         <p v-if="t.note" class="ticket-note">💬 {{ t.note }}</p>
 
         <!-- 分析摘要 -->
-        <div v-if="t.result_summary && !t.result_analysis" class="ticket-summary">
-          {{ t.result_summary }}
-        </div>
+        <div v-if="t.result_summary && !t.result_analysis" class="ticket-summary" v-html="renderMd(t.result_summary)"></div>
 
         <!-- 错误信息 -->
         <div v-if="t.error_message" class="ticket-error">
@@ -197,6 +195,7 @@ import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { marked } from 'marked'
 
 const route = useRoute()
 const task = ref({})
@@ -207,6 +206,7 @@ const showLog = ref(false)
 const logLoading = ref(false)
 let ws = null
 let refreshInterval = null
+let _unmounted = false
 
 const progress = ref(0)
 const reportDialogVisible = ref(false)
@@ -223,16 +223,22 @@ function renderMd(text) {
   const safe = text.replace(/<script[\s\S]*?<\/script>/gi, '')
                     .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
                     .replace(/on\w+\s*=\s*["'][^"']*["']/gi, '')
-  try { return window.marked?.parse(safe) || safe } catch { return safe }
+  try { return marked.parse(safe) || safe } catch { return safe }
 }
 
 async function loadTask() {
   const data = await api.getTask(route.params.id)
-  // 为每个 ticket 初始化折叠状态（确保 Vue 响应式）
+  // 保留已展开的折叠状态（防止 WS progress 刷新导致折叠）
+  const oldTickets = task.value?.tickets || []
+  const expandedMap = {}
+  oldTickets.forEach(t => {
+    if (t._showAnalysis || t._showReport) expandedMap[t.id] = { a: t._showAnalysis, r: t._showReport }
+  })
   if (data.tickets) {
     data.tickets.forEach(t => {
-      t._showAnalysis = false
-      t._showReport = false
+      const prev = expandedMap[t.id]
+      t._showAnalysis = prev?.a || false
+      t._showReport = prev?.r || false
     })
   }
   task.value = data
@@ -254,20 +260,27 @@ async function loadLogs() {
   } finally { logLoading.value = false }
 }
 
+let _progressTimer = null
 function connectWs() {
+  const taskId = route.params.id
+  if (!taskId || taskId === 'undefined' || _unmounted) return
   const token = localStorage.getItem('token')
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  ws = new WebSocket(`${proto}//${location.host}/ws/tasks/${route.params.id}/logs?token=${token}`)
+  ws = new WebSocket(`${proto}//${location.host}/ws/tasks/${taskId}/logs?token=${token}`)
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data)
     if (msg.type === 'log') {
       logLines.value.push({ content: msg.content, type: msg.log_type || 'stdout' })
       if (autoScroll.value) nextTick(() => { if (logContainer.value) logContainer.value.scrollTop = logContainer.value.scrollHeight })
-    } else if (msg.type === 'complete' || msg.type === 'progress') {
+    } else if (msg.type === 'complete') {
       loadTask()
+    } else if (msg.type === 'progress') {
+      // debounce: 3 秒内只刷新一次，避免频繁重渲染关闭展开区域
+      if (_progressTimer) clearTimeout(_progressTimer)
+      _progressTimer = setTimeout(() => loadTask(), 3000)
     }
   }
-  ws.onclose = () => { setTimeout(() => { if (task.value.status === 'running') connectWs() }, 2000) }
+  ws.onclose = () => { setTimeout(() => { if (!_unmounted && task.value.status === 'running') connectWs() }, 2000) }
 }
 
 async function evaluate(ticket, passed) {
@@ -343,8 +356,10 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  _unmounted = true
   if (ws) ws.close()
   if (refreshInterval) clearInterval(refreshInterval)
+  if (_progressTimer) clearTimeout(_progressTimer)
 })
 </script>
 
@@ -466,7 +481,7 @@ onUnmounted(() => {
 .conclusion-bar {
   margin-top: 14px;
   padding: 12px 16px;
-  background: linear-gradient(90deg, rgba(99,102,241,0.08), transparent);
+  background: linear-gradient(90deg, rgba(59,130,246,0.08), transparent);
   border-left: 3px solid var(--accent-indigo);
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   font-size: 0.88rem;

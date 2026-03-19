@@ -184,7 +184,7 @@ async def get_user_detail(
         result = []
         for t in tasks:
             tickets = await conn.fetch(
-                "SELECT ticket_id, note, status, duration FROM task_tickets WHERE task_id=$1",
+                "SELECT ticket_id, ticket_title, note, status, duration, result_summary FROM task_tickets WHERE task_id=$1 ORDER BY seq_order",
                 t["id"],
             )
             result.append({
@@ -197,13 +197,44 @@ async def get_user_detail(
                 "status": t["status"],
                 "created_at": str(t["created_at"]),
                 "tickets": [
-                    {"ticket_id": tt["ticket_id"], "note": tt["note"] or "",
+                    {"ticket_id": tt["ticket_id"], "ticket_title": tt["ticket_title"] or "",
+                     "note": tt["note"] or "", "result_summary": tt["result_summary"] or "",
                      "status": tt["status"], "duration": tt["duration"]}
                     for tt in tickets
                 ],
             })
 
     return result
+
+
+@router.get("/users/{user_id}/trends")
+async def get_user_trends(
+    user_id: int,
+    days: int = Query(90, ge=1, le=365),
+    granularity: str = Query("day"),
+    admin: UserInfo = Depends(require_admin),
+):
+    """用户使用频次趋势 [FR-022]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        trunc = {"week": "week", "month": "month"}.get(granularity, "day")
+        rows = await conn.fetch(f"""
+            SELECT
+                DATE_TRUNC('{trunc}', created_at)::DATE as dt,
+                COUNT(*) as task_count,
+                COALESCE(SUM(ticket_count), 0) as ticket_count
+            FROM tasks
+            WHERE user_id=$1
+              AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+              AND status IN ('completed', 'failed')
+            GROUP BY dt
+            ORDER BY dt
+        """, user_id, str(days))
+
+    return [
+        {"date": str(r["dt"]), "task_count": r["task_count"], "ticket_count": r["ticket_count"]}
+        for r in rows
+    ]
 
 
 @router.get("/evaluations/stats")
