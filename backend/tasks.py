@@ -111,6 +111,8 @@ def normalize_ticket_id(tid: str) -> str:
 @router.post("", response_model=TaskInfo)
 async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_current_user)):
     """创建工单处理任务 [FR-004]"""
+    import asyncio
+
     if not req.tickets:
         raise HTTPException(status_code=400, detail="至少需要一个工单号")
 
@@ -126,8 +128,9 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
                 validate_path(mp, "额外挂载路径")
 
     pool = await get_pool()
+
+    # ---- 步骤1: 查凭证（快速 DB 查询，单独获取连接）----
     async with pool.acquire() as conn:
-        # 验证服务器和凭证
         cred = await conn.fetchrow("""
             SELECT usc.*, s.name as server_name, s.host, s.ssh_port
             FROM user_server_credentials usc
@@ -137,93 +140,93 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
         if not cred:
             raise HTTPException(status_code=400, detail="凭证不存在或未验证")
 
-        # ---- SSH 路径预校验 ----
-        try:
-            from crypto import decrypt_password
-            from ssh_pool import get_ssh_connection
+    # ---- 步骤2: SSH 路径预校验（不占 DB 连接）----
+    try:
+        from crypto import decrypt_password
+        from ssh_pool import get_ssh_connection
 
-            ssh_password = decrypt_password(cred["ssh_password_encrypted"])
-            ssh_conn = await get_ssh_connection(
-                cred["host"], cred["ssh_port"],
-                cred["ssh_username"], ssh_password,
-            )
+        ssh_password = decrypt_password(cred["ssh_password_encrypted"])
+        ssh_conn = await asyncio.wait_for(
+            get_ssh_connection(cred["host"], cred["ssh_port"], cred["ssh_username"], ssh_password),
+            timeout=15,
+        )
 
-            # 收集所有需要检查的路径
-            paths_to_check = [req.agent_dir]
-            for t in req.tickets:
-                if t.code_directory:
-                    paths_to_check.append(t.code_directory)
-                for mp in t.extra_mounts:
-                    if mp and mp.strip():
-                        paths_to_check.append(mp.strip())
-
-            # 去重
-            paths_to_check = list(dict.fromkeys(paths_to_check))
-
-            # 构建一条 shell 命令批量检查所有路径
-            # 输出格式: path|EXISTS 或 path|MISSING
-            check_parts = []
-            for p in paths_to_check:
-                safe_p = p.replace("'", "'\\''")
-                check_parts.append(f"if [ -d '{safe_p}' ]; then echo '{safe_p}|EXISTS'; else echo '{safe_p}|MISSING'; fi")
-            check_cmd = " && ".join(check_parts)
-
-            import asyncio
-            proc = await ssh_conn.create_process(check_cmd)
-            proc.stdin.write_eof()
-            output = ""
-            async for line in proc.stdout:
-                output += line
-            await asyncio.wait_for(proc.wait(), timeout=15)
-
-            missing_paths = []
-            for line in output.strip().split('\n'):
-                if '|MISSING' in line:
-                    missing_path = line.split('|')[0]
-                    missing_paths.append(missing_path)
-
-            if missing_paths:
-                detail_parts = []
-                for mp in missing_paths:
-                    if mp == req.agent_dir:
-                        detail_parts.append(f"Agent 目录不存在: {mp}")
-                    else:
-                        detail_parts.append(f"路径不存在: {mp}")
-                raise HTTPException(
-                    status_code=400,
-                    detail="以下路径在服务器 {} 上不存在:\n{}".format(
-                        cred['host'], "\n".join(detail_parts)
-                    )
-                )
-
-        except HTTPException:
-            raise  # 重新抛出我们自己的异常
-        except Exception as e:
-            # SSH 连接失败等情况，记录日志但不阻止提交（路径可能确实存在）
-            logger.warning(f"SSH 路径预校验失败 (server={cred['host']}): {e}")
-
-        # 收集所有额外挂载路径（去重）
-        all_extra_mounts = set()
+        paths_to_check = [req.agent_dir]
         for t in req.tickets:
+            if t.code_directory:
+                paths_to_check.append(t.code_directory)
             for mp in t.extra_mounts:
                 if mp and mp.strip():
-                    all_extra_mounts.add(mp.strip())
+                    paths_to_check.append(mp.strip())
+        paths_to_check = list(dict.fromkeys(paths_to_check))
 
-        # 创建任务（含 agent_dir）
-        task_id = await conn.fetchval("""
-            INSERT INTO tasks (user_id, server_id, credential_id, status, ticket_count, submitted_at, agent_dir, task_mode)
-            VALUES ($1, $2, $3, 'pending', $4, NOW(), $5, $6)
-            RETURNING id
-        """, user.id, req.server_id, req.credential_id, len(req.tickets), req.agent_dir, req.task_mode)
+        check_parts = []
+        for p in paths_to_check:
+            safe_p = p.replace("'", "'\\''")
+            check_parts.append(f"if [ -d '{safe_p}' ]; then echo '{safe_p}|EXISTS'; else echo '{safe_p}|MISSING'; fi")
+        check_cmd = " && ".join(check_parts)
 
-        # 创建工单明细
-        for i, t in enumerate(req.tickets):
-            normalized_id = normalize_ticket_id(t.ticket_id)
-            extra_mounts_str = ','.join(m for m in t.extra_mounts if m)
-            await conn.execute("""
-                INSERT INTO task_tickets (task_id, ticket_id, note, code_directory, extra_mounts, status, seq_order)
-                VALUES ($1, $2, $3, $4, $5, 'pending', $6)
-            """, task_id, normalized_id, t.note, t.code_directory, extra_mounts_str, i)
+        proc = await ssh_conn.create_process(check_cmd)
+        proc.stdin.write_eof()
+        output = ""
+        async for line in proc.stdout:
+            output += line
+        await asyncio.wait_for(proc.wait(), timeout=15)
+
+        missing_paths = []
+        for line in output.strip().split('\n'):
+            if '|MISSING' in line:
+                missing_paths.append(line.split('|')[0])
+
+        if missing_paths:
+            detail_parts = []
+            for mp in missing_paths:
+                if mp == req.agent_dir:
+                    detail_parts.append(f"Agent 目录不存在: {mp}")
+                else:
+                    detail_parts.append(f"路径不存在: {mp}")
+            raise HTTPException(
+                status_code=400,
+                detail="以下路径在服务器 {} 上不存在:\n{}".format(
+                    cred['host'], "\n".join(detail_parts)
+                )
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"SSH 路径预校验失败 (server={cred['host']}): {e}")
+
+    # ---- 步骤3: 事务创建任务+工单（原子操作，防止空任务）----
+    async with pool.acquire() as conn:
+        # 防重复提交: 5分钟内同用户/同服务器/同目录不允许重复创建
+        existing = await conn.fetchval("""
+            SELECT id FROM tasks
+            WHERE user_id=$1 AND server_id=$2 AND agent_dir=$3
+              AND status IN ('pending', 'running')
+              AND submitted_at > NOW() - INTERVAL '5 minutes'
+            LIMIT 1
+        """, user.id, req.server_id, req.agent_dir)
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"您在 5 分钟内已提交过相同任务 (#{existing})，请勿重复提交。如需重新提交请稍候。"
+            )
+
+        async with conn.transaction():
+            task_id = await conn.fetchval("""
+                INSERT INTO tasks (user_id, server_id, credential_id, status, ticket_count, submitted_at, agent_dir, task_mode)
+                VALUES ($1, $2, $3, 'pending', $4, NOW(), $5, $6)
+                RETURNING id
+            """, user.id, req.server_id, req.credential_id, len(req.tickets), req.agent_dir, req.task_mode)
+
+            for i, t in enumerate(req.tickets):
+                normalized_id = normalize_ticket_id(t.ticket_id)
+                extra_mounts_str = ','.join(m for m in t.extra_mounts if m)
+                await conn.execute("""
+                    INSERT INTO task_tickets (task_id, ticket_id, note, code_directory, extra_mounts, status, seq_order)
+                    VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+                """, task_id, normalized_id, t.note, t.code_directory, extra_mounts_str, i)
 
         row = await conn.fetchrow("""
             SELECT t.*, s.name as server_name

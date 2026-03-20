@@ -175,6 +175,14 @@ async def _execute_task(task_id: int):
                 task_id,
             )
 
+            # 空任务保护（无工单记录则直接完成，防止空壳任务卡在队列）
+            if not tickets:
+                logger.warning(f"任务 {task_id} 无待执行工单，直接标记完成")
+                await conn.execute(
+                    "UPDATE tasks SET status='completed', completed_at=NOW() WHERE id=$1",
+                    task_id)
+                return
+
         # 广播状态变更
         await _broadcast_log(task_id, {
             "type": "status", "status": "running",
@@ -362,6 +370,31 @@ async def _execute_task(task_id: int):
                         await conn.execute(
                             "UPDATE task_tickets SET status='failed', error_message=$1, completed_at=NOW() WHERE id=$2",
                             error_msg, db_id)
+                # SSH 断连检测 + 自动重连（防止后续工单连锁失败）
+                err_lower = str(e).lower()
+                if 'connection closed' in err_lower or 'connection lost' in err_lower or 'connection reset' in err_lower:
+                    logger.warning(f"检测到 SSH 断连，尝试重连 {task['host']}...")
+                    await _save_log(task_id, "⚠️ SSH 连接已断开，正在重连...", "system")
+                    try:
+                        ssh_conn = await get_ssh_connection(
+                            task["host"], task["ssh_port"],
+                            task["ssh_username"], ssh_password,
+                        )
+                        logger.info(f"SSH 重连成功: {task['host']}")
+                        await _save_log(task_id, "✅ SSH 重连成功，继续执行后续工单", "system")
+                    except Exception as re_err:
+                        reconnect_msg = f"SSH 重连失败: {re_err}，剩余工单将全部标记失败"
+                        logger.error(reconnect_msg)
+                        await _save_log(task_id, reconnect_msg, "system")
+                        # 重连失败，将剩余工单全部标 failed
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE task_tickets SET status='failed', error_message=$1, completed_at=NOW() WHERE task_id=$2 AND status='pending'",
+                                f"SSH 连接丢失且重连失败: {re_err}", task_id)
+                            remaining = await conn.fetchval(
+                                "SELECT count(*) FROM task_tickets WHERE task_id=$1 AND status='failed'", task_id)
+                            failed_count = remaining
+                        break
                 # 继续执行下一个工单（不中断循环）
                 continue
 

@@ -1,6 +1,6 @@
 import axios from 'axios'
 
-const api = axios.create({ baseURL: '/api', timeout: 30000 })
+const api = axios.create({ baseURL: '/api', timeout: 120000 })
 
 // 请求拦截: 自动添加 Token
 api.interceptors.request.use(config => {
