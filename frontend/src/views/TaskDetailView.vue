@@ -786,39 +786,102 @@ onUnmounted(() => {
 .report-content {
   max-height: 65vh;
   overflow: auto;
-  font-size: 0.9rem;
-  line-height: 1.8;
-  padding: 4px;
+  font-size: 15px;
+  line-height: 1.75;
+  padding: 12px 16px;
+  color: #1e293b;
 }
-.report-content h1, .report-content h2, .report-content h3 {
-  margin-top: 18px;
+/* 使用 :deep() 穿透 scoped 限制，作用于 v-html 渲染的 markdown 内容 */
+.report-content :deep(*) {
+  color: #1e293b;
+}
+.report-content :deep(h1) {
+  font-size: 22px;
+  margin-top: 24px;
+  margin-bottom: 12px;
+  color: #0f172a !important;
+  font-weight: 700;
+}
+.report-content :deep(h2) {
+  font-size: 19px;
+  margin-top: 20px;
+  margin-bottom: 10px;
+  color: #0f172a !important;
+  font-weight: 600;
+}
+.report-content :deep(h3) {
+  font-size: 16px;
+  margin-top: 16px;
   margin-bottom: 8px;
-  color: var(--text-primary);
+  color: #1e293b !important;
+  font-weight: 600;
 }
-.report-content table {
+.report-content :deep(h4),
+.report-content :deep(h5),
+.report-content :deep(h6) {
+  color: #1e293b !important;
+  font-weight: 600;
+}
+.report-content :deep(p) {
+  margin: 8px 0;
+  color: #1e293b !important;
+}
+.report-content :deep(ul),
+.report-content :deep(ol) {
+  margin: 8px 0;
+  padding-left: 24px;
+  color: #1e293b !important;
+}
+.report-content :deep(li) {
+  margin: 4px 0;
+  color: #1e293b !important;
+}
+.report-content :deep(strong) {
+  color: #0f172a !important;
+  font-weight: 700;
+}
+.report-content :deep(em) {
+  color: #334155 !important;
+}
+.report-content :deep(table) {
   width: 100%;
   border-collapse: collapse;
-  margin: 12px 0;
+  margin: 14px 0;
+  font-size: 14px;
 }
-.report-content th, .report-content td {
-  padding: 8px 12px;
-  border: 1px solid var(--border);
+.report-content :deep(th),
+.report-content :deep(td) {
+  padding: 10px 14px;
+  border: 1px solid #e2e8f0;
   text-align: left;
+  color: #1e293b !important;
 }
-.report-content th { background: var(--bg-secondary); font-weight: 600; }
-.report-content code {
-  background: var(--bg-surface);
+.report-content :deep(th) {
+  background: #f8fafc;
+  font-weight: 600;
+  color: #0f172a !important;
+}
+.report-content :deep(code) {
+  background: #f1f5f9;
   padding: 2px 6px;
   border-radius: 4px;
   font-family: var(--font-mono);
-  font-size: 0.85em;
+  font-size: 13px;
+  color: #334155 !important;
 }
-.report-content pre {
-  background: var(--bg-surface);
+.report-content :deep(pre) {
+  background: #f1f5f9;
   padding: 14px;
-  border-radius: var(--radius-sm);
+  border-radius: 8px;
   overflow-x: auto;
-  border: 1px solid var(--border);
+  border: 1px solid #e2e8f0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #334155 !important;
+}
+.report-content :deep(a) {
+  color: #2563eb !important;
+  text-decoration: underline;
 }
 
 @keyframes pulse-glow {

@@ -294,6 +294,7 @@ async def _execute_task(task_id: int):
 
             # 追踪当前阶段（用于 stdout 日志关联）
             current_phase = "container_starting"
+            container_name = ""  # 追踪 AI 容器名称，用于报告读取
 
             # SSH 执行（2小时总超时 + 20分钟心跳超时保护）[FR-111]
             ticket_success = False
@@ -327,6 +328,14 @@ async def _execute_task(task_id: int):
                     line = line.rstrip("\n")
                     if not line:
                         continue
+
+                    # 捕获容器名（ones-AI 输出: "正在进入容器: ones-ai-xxx-123 ..."）
+                    if not container_name and ("正在进入容器" in line or "Entering container" in line):
+                        import re as _re
+                        _m = _re.search(r'(ones-ai-[\w-]+)', line)
+                        if _m:
+                            container_name = _m.group(1)
+                            logger.info(f"捕获容器名: {container_name}")
 
                     # 解析 [PHASE] 标记行（由 runner 输出）
                     if line.startswith("[PHASE]"):
@@ -397,6 +406,16 @@ async def _execute_task(task_id: int):
                                 ticket_success = True
                             else:
                                 failed_count += 1
+
+                            # 【关键】JSON结果已解析，立即下载报告（容器此时仍在运行）
+                            # ones-AI 退出后会清理容器，workspace/ 目录随之消失
+                            if report_path and container_name:
+                                try:
+                                    await _download_single_report(
+                                        ssh_conn, pool, db_id,
+                                        container_name=container_name)
+                                except Exception as dl_err:
+                                    logger.warning(f"提前下载报告失败: {dl_err}")
 
                             # 日志
                             status_emoji = "\u2705" if ticket_status == "success" else "\u274c"
@@ -512,8 +531,8 @@ async def _execute_task(task_id: int):
             else:
                 await complete_remaining_phases(db_id, "skipped", "前序阶段失败，已跳过")
 
-            # 执行完一个工单后立即下载报告
-            await _download_single_report(ssh_conn, pool, db_id)
+            # 执行完一个工单后立即下载报告（传入容器名用于 docker exec 读取）
+            await _download_single_report(ssh_conn, pool, db_id, container_name=container_name)
 
             # 增量更新 tasks 表（前端实时看到进度）
             async with pool.acquire() as conn:
@@ -602,8 +621,14 @@ async def _execute_task(task_id: int):
             )
 
 
-async def _download_single_report(ssh_conn, pool, db_id: int):
-    """下载单个工单的 1.md 报告文件"""
+async def _download_single_report(ssh_conn, pool, db_id: int, container_name: str = ""):
+    """下载单个工单的 1.md 报告文件
+    
+    多级读取策略:
+    1. 通过 docker exec 在容器内读取（workspace/ 只在容器内存在）
+    2. 通过 docker cp 从容器拷贝到宿主机后读取
+    3. 直接从宿主机路径读取（兼容 volume mount 场景）
+    """
     try:
         async with pool.acquire() as conn:
             ticket = await conn.fetchrow(
@@ -617,14 +642,14 @@ async def _download_single_report(ssh_conn, pool, db_id: int):
         report_path = ticket["report_path"].strip()
         agent_dir = (ticket["agent_dir"] or "").strip()
         code_dir = (ticket["code_directory"] or "").strip()
+        ticket_id_str = ticket["ticket_id"]
 
         # 清洗 report_path（AI 输出可能含多余文本，如 "报告位置\nworkspace/..."）
         if "workspace/" in report_path:
             report_path = report_path[report_path.index("workspace/"):]
         report_path = report_path.replace("\n", "").replace("`", "").strip()
 
-        # 报告路径（如 workspace/doc/xxx/report/1.md）是相对于 agent_dir 的
-        # 因为 ones-AI 在 agent_dir (Lango-Agent-Teams) 下创建 workspace/doc/
+        # 构建宿主机绝对路径（fallback 用）
         if not report_path.startswith("/"):
             if agent_dir:
                 abs_path = f"{agent_dir.rstrip('/')}/{report_path}"
@@ -635,8 +660,9 @@ async def _download_single_report(ssh_conn, pool, db_id: int):
         else:
             abs_path = report_path
 
-        async def _fetch(_path=abs_path):
-            proc = await ssh_conn.create_process(f"cat '{_path}' 2>/dev/null")
+        async def _ssh_cat(path: str) -> str:
+            """通过 SSH 在宿主机上 cat 文件"""
+            proc = await ssh_conn.create_process(f"cat '{path}' 2>/dev/null")
             proc.stdin.write_eof()
             content = ""
             async for rline in proc.stdout:
@@ -644,16 +670,128 @@ async def _download_single_report(ssh_conn, pool, db_id: int):
             await proc.wait()
             return content
 
-        report_content = await asyncio.wait_for(_fetch(), timeout=30)
+        async def _docker_exec_cat(container: str, path: str) -> str:
+            """通过 docker exec 在容器内 cat 文件"""
+            proc = await ssh_conn.create_process(
+                f"docker exec {container} cat '{path}' 2>/dev/null")
+            proc.stdin.write_eof()
+            content = ""
+            async for rline in proc.stdout:
+                content += rline
+            await proc.wait()
+            return content
+
+        async def _docker_cp_then_cat(container: str, src: str) -> str:
+            """通过 docker cp 先拷贝到宿主机 /tmp 再 cat"""
+            tmp_dest = f"/tmp/_onesai_report_{db_id}.md"
+            proc = await ssh_conn.create_process(
+                f"docker cp '{container}:{src}' '{tmp_dest}' 2>/dev/null && cat '{tmp_dest}' && rm -f '{tmp_dest}'")
+            proc.stdin.write_eof()
+            content = ""
+            async for rline in proc.stdout:
+                content += rline
+            await proc.wait()
+            return content
+
+        report_content = ""
+
+        # 策略 1: docker exec 在容器内读取（workspace/ 通常只在容器内）
+        if container_name and report_path:
+            try:
+                # 尝试容器内的几种可能路径
+                for try_path in [
+                    f"/home/user/{report_path}",       # 容器内工作目录
+                    f"/root/{report_path}",             # 容器 root 目录
+                    f"/{report_path}",                  # 绝对路径
+                    report_path,                        # 相对路径
+                ]:
+                    content = await asyncio.wait_for(
+                        _docker_exec_cat(container_name, try_path), timeout=10)
+                    if content.strip():
+                        report_content = content
+                        logger.info(f"[策略1-docker exec] 成功读取: {container_name}:{try_path}")
+                        break
+            except Exception as e:
+                logger.debug(f"[策略1-docker exec] 失败: {e}")
+
+        # 策略 2: docker cp 拷贝出来
+        if not report_content.strip() and container_name and report_path:
+            try:
+                for try_path in [
+                    f"/home/user/{report_path}",
+                    f"/root/{report_path}",
+                    report_path,
+                ]:
+                    content = await asyncio.wait_for(
+                        _docker_cp_then_cat(container_name, try_path), timeout=15)
+                    if content.strip():
+                        report_content = content
+                        logger.info(f"[策略2-docker cp] 成功读取: {container_name}:{try_path}")
+                        break
+            except Exception as e:
+                logger.debug(f"[策略2-docker cp] 失败: {e}")
+
+        # 策略 3: 宿主机直接 cat（多路径尝试）
+        # workspace/ 实际在 code_directory 或 HOME 下（不在 agent_dir 下，因为 agent_dir 是 ro 挂载）
+        if not report_content.strip():
+            host_try_paths = []
+            if code_dir:
+                host_try_paths.append(f"{code_dir.rstrip('/')}/{report_path}")
+            host_try_paths.append(abs_path)  # agent_dir 拼接的路径（原逻辑）
+            if agent_dir:
+                # 尝试用户 HOME（agent_dir 的父目录通常是 HOME）
+                user_home = agent_dir.rstrip('/').rsplit('/', 1)[0]
+                host_try_paths.append(f"{user_home}/{report_path}")
+            for try_host_path in host_try_paths:
+                try:
+                    content = await asyncio.wait_for(
+                        _ssh_cat(try_host_path), timeout=10)
+                    if content.strip():
+                        report_content = content
+                        logger.info(f"[策略3-宿主机cat] 成功读取: {try_host_path}")
+                        break
+                except Exception as e:
+                    logger.debug(f"[策略3-宿主机cat] {try_host_path} 失败: {e}")
+
+        # 策略 4: 搜索宿主机上可能的位置
+        if not report_content.strip() and (agent_dir or code_dir):
+            search_dirs = []
+            if code_dir:
+                search_dirs.append(code_dir)
+            if agent_dir:
+                search_dirs.append(agent_dir)
+            for sdir in search_dirs:
+                try:
+                    find_proc = await ssh_conn.create_process(
+                        f"find '{sdir}' -maxdepth 5 -path '*{ticket_id_str}*/report/1.md' -type f 2>/dev/null | head -1")
+                    find_proc.stdin.write_eof()
+                    found = ""
+                    async for rline in find_proc.stdout:
+                        found += rline
+                    await find_proc.wait()
+                    found = found.strip()
+                    if found:
+                        report_content = await asyncio.wait_for(
+                            _ssh_cat(found), timeout=15)
+                        if report_content.strip():
+                            logger.info(f"[策略4-find搜索] 成功读取: {found}")
+                            break
+                except Exception as e:
+                    logger.debug(f"[策略4-find搜索] {sdir} 失败: {e}")
+
+        # 写入数据库
         if report_content.strip():
             async with pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE task_tickets SET result_report=$1 WHERE id=$2",
                     report_content.strip(), db_id,
                 )
-            logger.info(f"已下载报告: {abs_path} (ticket={ticket['ticket_id']})")
+            logger.info(f"已下载报告: {ticket_id_str} (db_id={db_id})")
         else:
-            logger.warning(f"报告内容为空: {abs_path} (ticket={ticket['ticket_id']})")
+            logger.warning(
+                f"报告获取失败: {ticket_id_str} (db_id={db_id}), "
+                f"report_path={report_path}, container={container_name}, abs_path={abs_path}")
+
     except asyncio.TimeoutError:
         logger.warning(f"下载报告超时 (db_id={db_id})")
     except Exception as e:

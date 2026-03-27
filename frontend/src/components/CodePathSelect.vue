@@ -1,21 +1,18 @@
 <template>
   <div class="code-path-select">
-    <el-select
-      v-model="selectedPath"
-      filterable
-      allow-create
-      default-first-option
-      clearable
+    <el-autocomplete
+      v-model="inputValue"
+      :fetch-suggestions="querySearch"
       placeholder="输入或选择代码路径"
-      class="path-select"
-      @change="handleChange"
+      clearable
+      :trigger-on-focus="true"
+      highlight-first-item
+      class="path-autocomplete"
+      @select="handleSelect"
+      @change="handleInput"
+      @clear="handleClear"
     >
-      <el-option
-        v-for="item in paths"
-        :key="item.id"
-        :label="item.path"
-        :value="item.path"
-      >
+      <template #default="{ item }">
         <div class="path-option">
           <span class="path-text">{{ item.path }}</span>
           <span class="path-count">{{ item.use_count }}次</span>
@@ -23,13 +20,13 @@
             <Close />
           </el-icon>
         </div>
-      </el-option>
-    </el-select>
+      </template>
+    </el-autocomplete>
   </div>
 </template>
 
 <script setup>
-import { ref, watch, onMounted, defineProps, defineEmits } from 'vue'
+import { ref, watch, defineProps, defineEmits } from 'vue'
 import { Close } from '@element-plus/icons-vue'
 import api from '../api'
 
@@ -40,36 +37,61 @@ const props = defineProps({
 
 const emit = defineEmits(['update:modelValue'])
 
-const selectedPath = ref(props.modelValue)
-const paths = ref([])
+const inputValue = ref(props.modelValue)
+const allPaths = ref([])
 
-watch(() => props.modelValue, (val) => { selectedPath.value = val })
+// 同步外部传入的 modelValue
+watch(() => props.modelValue, (val) => { inputValue.value = val })
+
+// serverId 变化时重新加载
 watch(() => props.serverId, () => { loadPaths() }, { immediate: true })
 
-function handleChange(val) {
+// 内部输入变化时向外同步
+function handleInput(val) {
   emit('update:modelValue', val || '')
 }
 
+function handleSelect(item) {
+  inputValue.value = item.path
+  emit('update:modelValue', item.path)
+}
+
+function handleClear() {
+  emit('update:modelValue', '')
+}
+
+// autocomplete 搜索建议：聚焦时（queryString为空）显示全部，输入时过滤
+function querySearch(queryString, cb) {
+  const results = queryString
+    ? allPaths.value.filter(p =>
+        p.path.toLowerCase().includes(queryString.toLowerCase())
+      ).map(p => ({ ...p, value: p.path }))
+    : allPaths.value.map(p => ({ ...p, value: p.path }))
+  cb(results)
+}
+
 async function loadPaths() {
-  if (!props.serverId) { paths.value = []; return }
+  if (!props.serverId) { allPaths.value = []; return }
   try {
     const res = await api.getCodePaths(props.serverId)
-    paths.value = Array.isArray(res) ? res : (res?.paths || [])
+    const list = Array.isArray(res) ? res : (res?.paths || [])
+    allPaths.value = list.map(item => ({
+      ...item,
+      value: item.path,   // el-autocomplete 需要 value 字段
+    }))
   } catch (e) {
-    paths.value = []
+    allPaths.value = []
   }
 }
 
 async function handleDelete(pathId) {
   try {
     await api.deleteCodePath(pathId)
-    paths.value = paths.value.filter(p => p.id !== pathId)
+    allPaths.value = allPaths.value.filter(p => p.id !== pathId)
   } catch (e) {
     console.error('删除路径失败', e)
   }
 }
-
-// onMounted 不再需要，由 watch immediate 处理
 </script>
 
 <style scoped>
@@ -77,7 +99,7 @@ async function handleDelete(pathId) {
   width: 100%;
 }
 
-.path-select {
+.path-autocomplete {
   width: 100%;
 }
 
