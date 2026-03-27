@@ -33,6 +33,9 @@ export default {
   deleteCredential: (serverId, credId) => api.delete(`/servers/${serverId}/credentials/${credId}`),
   addServer: (data) => api.post('/servers', data),
   checkHealth: (serverId) => api.post(`/servers/${serverId}/health`),
+  toggleServer: (serverId) => api.patch(`/servers/${serverId}/toggle`),
+  getAgentDir: (serverId, credentialId) => api.get(`/servers/${serverId}/agent-dir`, { params: { credential_id: credentialId } }),
+  saveAgentDir: (serverId, data) => api.put(`/servers/${serverId}/agent-dir`, data),
   // Tasks
   createTask: (data) => api.post('/tasks', data),
   getTasks: (params) => api.get('/tasks', { params }),
@@ -41,6 +44,11 @@ export default {
   getTaskLogs: (id) => api.get(`/tasks/${id}/logs`),
   getTicketReport: (taskId, ticketId) => api.get(`/tasks/${taskId}/tickets/${ticketId}/report`),
   reworkTicket: (taskId, ticketId, data) => api.post(`/tasks/${taskId}/tickets/${ticketId}/rework`, data),
+  getTicketPhases: (taskId, ticketDbId) => api.get(`/tasks/${taskId}/tickets/${ticketDbId}/phases`),
+  editTicket: (taskId, ticketDbId, data) => api.put(`/tasks/${taskId}/tickets/${ticketDbId}`, data),
+  getCodePaths: (serverId) => api.get('/tasks/code-paths', { params: { server_id: serverId } }),
+  deleteCodePath: (pathId) => api.delete(`/tasks/code-paths/${pathId}`),
+  previewTickets: (data) => api.post('/tasks/preview', data),
   // Evaluations
   submitEval: (data) => api.post('/evaluations', data),
   // Admin
@@ -52,4 +60,10 @@ export default {
   getEvalStats: (days) => api.get('/admin/evaluations/stats', { params: { days } }),
   getConfigs: () => api.get('/admin/configs'),
   updateConfigs: (configs) => api.post('/admin/configs', { configs }),
+  // External Teams
+  getExternalTeams: () => api.get('/admin/external-teams'),
+  createExternalTeam: (data) => api.post('/admin/external-teams', data),
+  deleteExternalTeam: (id) => api.delete(`/admin/external-teams/${id}`),
+  getExternalTeamStats: (id, days) => api.get(`/admin/external-teams/${id}/stats`, { params: { days } }),
+  getExternalOverview: (days) => api.get('/admin/external-overview', { params: { days } }),
 }

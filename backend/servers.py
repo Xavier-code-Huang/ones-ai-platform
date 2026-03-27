@@ -33,6 +33,7 @@ class ServerInfo(BaseModel):
     description: str
     status: str
     has_ones_ai: bool
+    is_enabled: bool = True
     credential_count: int = 0
     has_my_credential: bool = False
 
@@ -65,7 +66,9 @@ async def list_servers(user: UserInfo = Depends(get_current_user)):
     """获取所有服务器列表（含当前用户凭证状态）[FR-002]"""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        # 管理员看全部，普通用户只看 is_enabled=true
+        where_clause = "" if user.role == "admin" else "WHERE s.is_enabled = TRUE"
+        rows = await conn.fetch(f"""
             SELECT s.*,
                    COALESCE(c.cred_count, 0) as credential_count,
                    COALESCE(mc.my_count, 0) > 0 as has_my_credential
@@ -81,6 +84,7 @@ async def list_servers(user: UserInfo = Depends(get_current_user)):
                 WHERE user_id = $1 AND is_verified = TRUE
                 GROUP BY server_id
             ) mc ON mc.server_id = s.id
+            {where_clause}
             ORDER BY s.name
         """, user.id)
 
@@ -93,6 +97,7 @@ async def list_servers(user: UserInfo = Depends(get_current_user)):
             description=r["description"] or "",
             status=r["status"],
             has_ones_ai=r["has_ones_ai"],
+            is_enabled=r["is_enabled"],
             credential_count=r["credential_count"],
             has_my_credential=r["has_my_credential"],
         )
@@ -196,7 +201,22 @@ async def add_server(req: AddServerRequest, user: UserInfo = Depends(require_adm
         id=row["id"], name=row["name"], host=row["host"],
         ssh_port=row["ssh_port"], description=row["description"] or "",
         status=row["status"], has_ones_ai=row["has_ones_ai"],
+        is_enabled=row["is_enabled"],
     )
+
+
+@router.patch("/{server_id}/toggle")
+async def toggle_server(server_id: int, user: UserInfo = Depends(require_admin)):
+    """启用/禁用服务器可见性（管理员）"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE servers SET is_enabled = NOT is_enabled WHERE id=$1 RETURNING id, name, is_enabled",
+            server_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="服务器不存在")
+    return {"id": row["id"], "name": row["name"], "is_enabled": row["is_enabled"]}
 
 
 @router.post("/{server_id}/health")
@@ -235,3 +255,46 @@ async def check_health(server_id: int, user: UserInfo = Depends(get_current_user
         )
 
     return {"status": status_val}
+
+
+# ---- Agent 目录记忆 ----
+
+class SaveAgentDirRequest(BaseModel):
+    credential_id: int
+    agent_dir: str
+
+
+@router.get("/{server_id}/agent-dir")
+async def get_agent_dir(
+    server_id: int,
+    credential_id: int,
+    user: UserInfo = Depends(get_current_user),
+):
+    """获取用户在该服务器+凭证下记忆的 Agent Teams 目录"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT agent_dir FROM user_agent_dirs
+            WHERE user_id=$1 AND server_id=$2 AND credential_id=$3
+        """, user.id, server_id, credential_id)
+    return {"agent_dir": row["agent_dir"] if row else ""}
+
+
+@router.put("/{server_id}/agent-dir")
+async def save_agent_dir(
+    server_id: int,
+    req: SaveAgentDirRequest,
+    user: UserInfo = Depends(get_current_user),
+):
+    """保存/更新用户在该服务器+凭证下的 Agent Teams 目录"""
+    if not req.agent_dir.strip():
+        return {"success": True}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO user_agent_dirs (user_id, server_id, credential_id, agent_dir, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (user_id, server_id, credential_id)
+            DO UPDATE SET agent_dir=$4, updated_at=NOW()
+        """, user.id, server_id, req.credential_id, req.agent_dir.strip())
+    return {"success": True}

@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 @Description: ones-AI 平台 — 任务执行引擎
-@Version: 1.0.0
-@Date: 2026-03-17
+@Version: 2.0.0
+@Date: 2026-03-26
 
-关联设计文档: §4.5 任务执行引擎
-关联需求: FR-005, FR-006
+关联设计文档: §4.5 任务执行引擎, §3.2 阶段推进
+关联需求: FR-005, FR-006, FR-103, FR-111
 """
 
 import asyncio
@@ -18,6 +18,10 @@ from datetime import datetime, timezone
 from crypto import decrypt_password
 from database import get_pool
 from ssh_pool import get_ssh_connection
+from phases import (
+    init_phases, advance_phase, complete_remaining_phases,
+    format_phase_for_ws,
+)
 
 logger = logging.getLogger("ones-ai.executor")
 
@@ -81,14 +85,14 @@ async def _broadcast_log(task_id: int, log_data: dict):
 
 
 async def _save_log(task_id: int, content: str, log_type: str = "stdout",
-                    ticket_id: int = None):
+                    ticket_id: int = None, phase_name: str = ""):
     """保存日志到数据库"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO task_logs (task_id, task_ticket_id, log_type, content)
-            VALUES ($1, $2, $3, $4)
-        """, task_id, ticket_id, log_type, content)
+            INSERT INTO task_logs (task_id, task_ticket_id, log_type, content, phase_name)
+            VALUES ($1, $2, $3, $4, $5)
+        """, task_id, ticket_id, log_type, content, phase_name)
 
 
 def _build_remote_command(tickets: list[dict], agent_dir: str = "",
@@ -249,20 +253,109 @@ async def _execute_task(task_id: int):
                     "UPDATE task_tickets SET status='running', started_at=COALESCE(started_at, NOW()) WHERE id=$1",
                     db_id)
 
-            # SSH 执行（2小时超时保护）
+            # 初始化阶段记录并推进前序阶段
+            await init_phases(db_id)
+
+            # 阶段 1: validating
+            await advance_phase(db_id, "validating", "active", "正在校验工单信息...")
+            await _broadcast_log(task_id, format_phase_for_ws(
+                "validating", "active", "正在校验工单信息...", ticket_id_str, db_id))
+            await advance_phase(db_id, "validating", "completed", "工单信息校验通过")
+            await _broadcast_log(task_id, format_phase_for_ws(
+                "validating", "completed", "工单信息校验通过", ticket_id_str, db_id))
+
+            # 阶段 2: checking_path
+            await advance_phase(db_id, "checking_path", "active", "正在检查代码路径...")
+            await _broadcast_log(task_id, format_phase_for_ws(
+                "checking_path", "active", "正在检查代码路径...", ticket_id_str, db_id))
+            await advance_phase(db_id, "checking_path", "completed",
+                                f"代码路径: {ticket['code_directory'] or '默认'}")
+            await _broadcast_log(task_id, format_phase_for_ws(
+                "checking_path", "completed",
+                f"代码路径: {ticket['code_directory'] or '默认'}", ticket_id_str, db_id))
+
+            # 阶段 3: checking_agent_dir
+            if agent_dir:
+                await advance_phase(db_id, "checking_agent_dir", "active", "正在检查 Agent-Teams 目录...")
+                await _broadcast_log(task_id, format_phase_for_ws(
+                    "checking_agent_dir", "active", "正在检查 Agent-Teams 目录...", ticket_id_str, db_id))
+                await advance_phase(db_id, "checking_agent_dir", "completed", f"Agent 目录: {agent_dir}")
+                await _broadcast_log(task_id, format_phase_for_ws(
+                    "checking_agent_dir", "completed", f"Agent 目录: {agent_dir}", ticket_id_str, db_id))
+            else:
+                await advance_phase(db_id, "checking_agent_dir", "skipped", "未配置 Agent-Teams 目录")
+                await _broadcast_log(task_id, format_phase_for_ws(
+                    "checking_agent_dir", "skipped", "未配置 Agent-Teams 目录", ticket_id_str, db_id))
+
+            # 阶段 4: container_starting
+            await advance_phase(db_id, "container_starting", "active", "正在启动容器环境...")
+            await _broadcast_log(task_id, format_phase_for_ws(
+                "container_starting", "active", "正在启动容器环境...", ticket_id_str, db_id))
+
+            # 追踪当前阶段（用于 stdout 日志关联）
+            current_phase = "container_starting"
+
+            # SSH 执行（2小时总超时 + 20分钟心跳超时保护）[FR-111]
             ticket_success = False
-            TICKET_TIMEOUT = 7200  # 2 小时
+            TICKET_TIMEOUT = 7200  # 2 小时总超时
+            HEARTBEAT_TIMEOUT = 1200  # 20 分钟无输出视为卡死
             try:
                 process = await ssh_conn.create_process(command)
                 process.stdin.write_eof()  # 关闭 stdin 防止 docker run -i 卡死
 
-                # 实时读取 stdout
-                async for line in process.stdout:
+                # 带心跳超时的实时 stdout 读取 [14.2]
+                while True:
+                    try:
+                        line = await asyncio.wait_for(
+                            process.stdout.readline(), timeout=HEARTBEAT_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        error_msg = f"⏰ 工单 {ticket_id_str} 超过 {HEARTBEAT_TIMEOUT//60} 分钟无输出，判定为卡死"
+                        logger.warning(error_msg)
+                        await _save_log(task_id, error_msg, "system")
+                        await _broadcast_log(task_id, {
+                            "type": "log", "content": error_msg, "log_type": "system",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        break
+                    if not line:  # EOF
+                        break
                     line = line.rstrip("\n")
                     if not line:
                         continue
 
-                    # 解析进度标记
+                    # 解析 [PHASE] 标记行（由 runner 输出）
+                    if line.startswith("[PHASE]"):
+                        parts = line[len("[PHASE]"):].strip().split(" ", 1)
+                        phase_name_raw = parts[0] if parts else ""
+                        phase_msg = parts[1] if len(parts) > 1 else ""
+
+                        if phase_name_raw.endswith("_done"):
+                            # 阶段完成标记
+                            real_phase = phase_name_raw[:-5]
+                            await advance_phase(db_id, real_phase, "completed", phase_msg)
+                            await _broadcast_log(task_id, format_phase_for_ws(
+                                real_phase, "completed", phase_msg, ticket_id_str, db_id))
+                        else:
+                            # 容器启动完成后的首个 agent 阶段
+                            if current_phase == "container_starting":
+                                await advance_phase(db_id, "container_starting", "completed", "容器环境已启动")
+                                await _broadcast_log(task_id, format_phase_for_ws(
+                                    "container_starting", "completed", "容器环境已启动", ticket_id_str, db_id))
+                            # 推进新阶段
+                            await advance_phase(db_id, phase_name_raw, "active", phase_msg)
+                            await _broadcast_log(task_id, format_phase_for_ws(
+                                phase_name_raw, "active", phase_msg, ticket_id_str, db_id))
+                            current_phase = phase_name_raw
+
+                        await _save_log(task_id, line, "phase", db_id, phase_name_raw)
+                        continue
+
+                    # 解析进度标记（旧版兼容）
                     if line.startswith("[PROGRESS]"):
                         try:
                             progress_data = json.loads(line[len("[PROGRESS] "):])
@@ -314,6 +407,20 @@ async def _execute_task(task_id: int):
                                 "log_type": "system",
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                             })
+
+                            # ---- 阶段完结：推进所有剩余阶段 ----
+                            if ticket_status == "success":
+                                # 成功：将当前 active 阶段和所有 pending 阶段标记为 completed
+                                await complete_remaining_phases(db_id, "completed", f"工单 {ticket_id_str} 处理完成")
+                                await _broadcast_log(task_id, format_phase_for_ws(
+                                    current_phase, "completed", f"工单处理完成 ({duration:.1f}s)", ticket_id_str, db_id))
+                            else:
+                                # 失败：当前阶段标记为 failed，其余标记为 skipped
+                                await advance_phase(db_id, current_phase, "failed", f"工单处理失败: {summary}")
+                                await _broadcast_log(task_id, format_phase_for_ws(
+                                    current_phase, "failed", f"工单处理失败", ticket_id_str, db_id))
+                                await complete_remaining_phases(db_id, "skipped", "因工单失败跳过")
+
                         except json.JSONDecodeError:
                             await _save_log(task_id, line, "stdout")
                             await _broadcast_log(task_id, {
@@ -323,9 +430,10 @@ async def _execute_task(task_id: int):
                         continue
 
                     # 普通日志
-                    await _save_log(task_id, line, "stdout")
+                    await _save_log(task_id, line, "stdout", db_id, current_phase)
                     await _broadcast_log(task_id, {
                         "type": "log", "content": line,
+                        "phase_name": current_phase,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
 
@@ -397,6 +505,12 @@ async def _execute_task(task_id: int):
                         break
                 # 继续执行下一个工单（不中断循环）
                 continue
+
+            # 清理工单剩余阶段
+            if ticket_success:
+                await complete_remaining_phases(db_id, "completed", "任务完成")
+            else:
+                await complete_remaining_phases(db_id, "skipped", "前序阶段失败，已跳过")
 
             # 执行完一个工单后立即下载报告
             await _download_single_report(ssh_conn, pool, db_id)
@@ -493,28 +607,36 @@ async def _download_single_report(ssh_conn, pool, db_id: int):
     try:
         async with pool.acquire() as conn:
             ticket = await conn.fetchrow(
-                "SELECT ticket_id, report_path, code_directory FROM task_tickets "
-                "WHERE id=$1 AND report_path != '' AND report_path IS NOT NULL",
+                "SELECT tt.ticket_id, tt.report_path, tt.code_directory, t.agent_dir "
+                "FROM task_tickets tt JOIN tasks t ON t.id = tt.task_id "
+                "WHERE tt.id=$1 AND tt.report_path != '' AND tt.report_path IS NOT NULL",
                 db_id,
             )
         if not ticket:
             return
-        report_path = ticket["report_path"]
-        code_dir = ticket["code_directory"] or ""
+        report_path = ticket["report_path"].strip()
+        agent_dir = (ticket["agent_dir"] or "").strip()
+        code_dir = (ticket["code_directory"] or "").strip()
 
-        # 报告路径可能是相对路径（如 workspace/doc/xxx/report/1.md）
-        # 需要拼接 code_directory 构建绝对路径
+        # 清洗 report_path（AI 输出可能含多余文本，如 "报告位置\nworkspace/..."）
+        if "workspace/" in report_path:
+            report_path = report_path[report_path.index("workspace/"):]
+        report_path = report_path.replace("\n", "").replace("`", "").strip()
+
+        # 报告路径（如 workspace/doc/xxx/report/1.md）是相对于 agent_dir 的
+        # 因为 ones-AI 在 agent_dir (Lango-Agent-Teams) 下创建 workspace/doc/
         if not report_path.startswith("/"):
-            if code_dir:
+            if agent_dir:
+                abs_path = f"{agent_dir.rstrip('/')}/{report_path}"
+            elif code_dir:
                 abs_path = f"{code_dir.rstrip('/')}/{report_path}"
             else:
-                # 没有 code_directory，尝试在 home 目录下查找
                 abs_path = report_path
         else:
             abs_path = report_path
 
         async def _fetch(_path=abs_path):
-            proc = await ssh_conn.create_process(f"cat {_path} 2>/dev/null")
+            proc = await ssh_conn.create_process(f"cat '{_path}' 2>/dev/null")
             proc.stdin.write_eof()
             content = ""
             async for rline in proc.stdout:
@@ -529,7 +651,9 @@ async def _download_single_report(ssh_conn, pool, db_id: int):
                     "UPDATE task_tickets SET result_report=$1 WHERE id=$2",
                     report_content.strip(), db_id,
                 )
-            logger.info(f"已下载报告: {report_path} (ticket={ticket['ticket_id']})")
+            logger.info(f"已下载报告: {abs_path} (ticket={ticket['ticket_id']})")
+        else:
+            logger.warning(f"报告内容为空: {abs_path} (ticket={ticket['ticket_id']})")
     except asyncio.TimeoutError:
         logger.warning(f"下载报告超时 (db_id={db_id})")
     except Exception as e:

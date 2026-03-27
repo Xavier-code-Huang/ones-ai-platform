@@ -220,8 +220,13 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
                 RETURNING id
             """, user.id, req.server_id, req.credential_id, len(req.tickets), req.agent_dir, req.task_mode)
 
+            # [FR-111] 14.1 工单级去重：同一任务内不允许重复工单号
+            seen_ids = set()
             for i, t in enumerate(req.tickets):
                 normalized_id = normalize_ticket_id(t.ticket_id)
+                if normalized_id in seen_ids:
+                    raise HTTPException(400, f"工单号 {normalized_id} 重复，请移除重复项")
+                seen_ids.add(normalized_id)
                 extra_mounts_str = ','.join(m for m in t.extra_mounts if m)
                 await conn.execute("""
                     INSERT INTO task_tickets (task_id, ticket_id, note, code_directory, extra_mounts, status, seq_order)
@@ -239,6 +244,20 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
     # 触发执行（异步）
     from task_executor import enqueue_task
     await enqueue_task(task_id)
+
+    # 自动保存代码路径历史 [FR-107]
+    try:
+        async with pool.acquire() as conn:
+            for t in req.tickets:
+                if t.code_directory:
+                    await conn.execute("""
+                        INSERT INTO user_code_paths (user_id, server_id, path, use_count, last_used_at)
+                        VALUES ($1, $2, $3, 1, NOW())
+                        ON CONFLICT (user_id, server_id, path)
+                        DO UPDATE SET use_count = user_code_paths.use_count + 1, last_used_at = NOW()
+                    """, user.id, req.server_id, t.code_directory)
+    except Exception as e:
+        logger.warning(f"保存代码路径历史失败: {e}")
 
     return TaskInfo(
         id=row["id"], user_id=row["user_id"], user_email=user.ones_email,
@@ -469,7 +488,7 @@ async def get_task_logs(
             raise HTTPException(status_code=403, detail="无权限")
 
         logs = await conn.fetch(
-            "SELECT content, log_type, timestamp FROM task_logs "
+            "SELECT content, log_type, phase_name, timestamp FROM task_logs "
             "WHERE task_id=$1 ORDER BY id",
             task_id,
         )
@@ -480,9 +499,145 @@ async def get_task_logs(
             {
                 "content": log["content"],
                 "log_type": log["log_type"],
+                "phase_name": log["phase_name"] if "phase_name" in log.keys() else "",
                 "timestamp": str(log["timestamp"]),
             }
             for log in logs
         ],
     }
+
+
+# ============================================================
+#  新增 API — 阶段查询 / 工单编辑 / 代码路径历史
+#  关联: FR-101, FR-107, FR-108
+# ============================================================
+
+@router.get("/{task_id}/tickets/{ticket_db_id}/phases")
+async def get_ticket_phases(
+    task_id: int, ticket_db_id: int,
+    user: UserInfo = Depends(get_current_user),
+):
+    """获取工单的处理阶段列表 [FR-101]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 权限校验
+        task = await conn.fetchrow(
+            "SELECT user_id FROM tasks WHERE id=$1", task_id
+        )
+        if not task:
+            raise HTTPException(404, "任务不存在")
+        if task["user_id"] != user.id and user.role != "admin":
+            raise HTTPException(403, "无权限")
+
+        ticket = await conn.fetchrow(
+            "SELECT id FROM task_tickets WHERE id=$1 AND task_id=$2",
+            ticket_db_id, task_id
+        )
+        if not ticket:
+            raise HTTPException(404, "工单不存在")
+
+    from phases import get_phases
+    phases = await get_phases(ticket_db_id)
+    return {"ticket_db_id": ticket_db_id, "phases": phases}
+
+
+class EditTicketRequest(BaseModel):
+    note: Optional[str] = None
+    code_directory: Optional[str] = None
+
+
+@router.put("/{task_id}/tickets/{ticket_db_id}")
+async def edit_pending_ticket(
+    task_id: int, ticket_db_id: int, req: EditTicketRequest,
+    user: UserInfo = Depends(get_current_user),
+):
+    """编辑排队中的工单（仅 pending 状态）[FR-108]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        task = await conn.fetchrow(
+            "SELECT user_id FROM tasks WHERE id=$1", task_id
+        )
+        if not task:
+            raise HTTPException(404, "任务不存在")
+        if task["user_id"] != user.id and user.role != "admin":
+            raise HTTPException(403, "无权限")
+
+        ticket = await conn.fetchrow(
+            "SELECT id, status FROM task_tickets WHERE id=$1 AND task_id=$2",
+            ticket_db_id, task_id
+        )
+        if not ticket:
+            raise HTTPException(404, "工单不存在")
+        if ticket["status"] != "pending":
+            raise HTTPException(400, f"只能编辑排队中的工单，当前状态: {ticket['status']}")
+
+        # 校验路径
+        if req.code_directory:
+            validate_path(req.code_directory, "代码位置")
+
+        # 动态构建 UPDATE
+        updates = []
+        params = []
+        param_idx = 1
+        if req.note is not None:
+            updates.append(f"note=${param_idx}")
+            params.append(req.note)
+            param_idx += 1
+        if req.code_directory is not None:
+            updates.append(f"code_directory=${param_idx}")
+            params.append(req.code_directory)
+            param_idx += 1
+
+        if not updates:
+            raise HTTPException(400, "没有需要更新的字段")
+
+        params.append(ticket_db_id)
+        sql = f"UPDATE task_tickets SET {', '.join(updates)} WHERE id=${param_idx}"
+        await conn.execute(sql, *params)
+
+    logger.info(f"编辑工单: task={task_id}, ticket={ticket_db_id}")
+    return {"message": "工单已更新", "ticket_db_id": ticket_db_id}
+
+
+@router.get("/code-paths")
+async def get_code_paths(
+    server_id: int = Query(..., description="服务器 ID"),
+    user: UserInfo = Depends(get_current_user),
+):
+    """获取用户在指定服务器上的历史代码路径 [FR-107]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, path, use_count, last_used_at
+            FROM user_code_paths
+            WHERE user_id=$1 AND server_id=$2
+            ORDER BY use_count DESC, last_used_at DESC
+            LIMIT 30
+        """, user.id, server_id)
+
+    return [
+        {
+            "id": r["id"],
+            "path": r["path"],
+            "use_count": r["use_count"],
+            "last_used_at": str(r["last_used_at"]) if r["last_used_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+@router.delete("/code-paths/{path_id}")
+async def delete_code_path(
+    path_id: int,
+    user: UserInfo = Depends(get_current_user),
+):
+    """删除历史代码路径 [FR-107]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM user_code_paths WHERE id=$1 AND user_id=$2",
+            path_id, user.id,
+        )
+    return {"message": "已删除"}
+
 

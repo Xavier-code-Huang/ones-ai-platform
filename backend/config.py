@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     CRYPTO_KEY: str = "0123456789abcdef0123456789abcdef"  # 32 字符 AES-256 密钥
 
     # ---- ONES API ----
-    ONES_API_GATEWAY: str = "http://172.60.1.103:10076"
+    ONES_API_GATEWAY: str = "http://172.60.1.103:9006"
     ONES_API_BASE_URL: str = "https://ones.lango-tech.com:7000"
 
     # ---- SSH ----
@@ -49,8 +49,20 @@ class Settings(BaseSettings):
     WECOM_SECRET: str = ""
     WECOM_WEBHOOK_URL: str = ""
 
+    # ---- 通知开关 ----
+    NOTIFY_WEBHOOK_ENABLED: bool = False
+    NOTIFY_EMAIL_ENABLED: bool = False
+
+    # ---- SMTP 邮件 ----
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASS: str = ""
+    SMTP_FROM_NAME: str = "ones-AI"
+
     # ---- AI 模型 ----
     AI_BASE_URL: str = "https://open.bigmodel.cn/api/anthropic"
+    AI_API_KEY: str = ""  # 智谱 API Key，用于 AI 预分析
     AI_SONNET_MODEL: str = "glm-4.7"
     AI_OPUS_MODEL: str = "glm-5"
 

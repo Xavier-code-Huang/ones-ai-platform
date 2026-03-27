@@ -1,7 +1,10 @@
 <template>
   <div class="page-container" id="admin-user-detail">
     <el-button @click="$router.back()" text type="primary" style="margin-bottom:12px;">← 返回用户列表</el-button>
-    <h1 class="fade-in-up" style="font-size:1.6rem;font-weight:700;">用户使用记录</h1>
+    <div class="page-header fade-in-up">
+      <h1>用户使用记录</h1>
+      <p>查看用户的任务提交频次与历史明细</p>
+    </div>
 
     <!-- [FR-022] 使用频次趋势图表 -->
     <div class="glass-card fade-in-up" style="margin-top:16px;padding:20px 24px;">
@@ -40,7 +43,7 @@
         <div v-for="tt in t.tickets" :key="tt.ticket_id" style="margin-top:8px;padding:8px 12px;background:var(--bg-secondary);border-radius:6px;font-size:0.85rem;">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <span>
-              <span style="color:var(--accent-blue);">{{ tt.ticket_id }}</span>
+              <span style="color:var(--accent-light);">{{ tt.ticket_id }}</span>
               <span v-if="tt.ticket_title" style="margin-left:8px;color:var(--text-primary);">{{ tt.ticket_title }}</span>
             </span>
             <span :class="tt.status==='completed'?'badge badge-success':'badge badge-danger'">{{ tt.status }}</span>
@@ -81,7 +84,7 @@ async function loadTrends() {
     const taskCounts = data.map(d => d.task_count)
     const ticketCounts = data.map(d => d.ticket_count)
 
-    if (!chart && chartRef.value) chart = echarts.init(chartRef.value, 'dark')
+    if (!chart && chartRef.value) chart = echarts.init(chartRef.value)
     if (!chart) return
 
     chart.setOption({
@@ -92,31 +95,31 @@ async function loadTrends() {
       xAxis: {
         type: 'category', data: dates,
         axisLabel: { color: '#94a3b8', fontSize: 11 },
-        axisLine: { lineStyle: { color: 'rgba(99,102,241,0.2)' } },
+        axisLine: { lineStyle: { color: 'rgba(30,64,175,0.2)' } },
       },
       yAxis: {
         type: 'value', minInterval: 1,
         axisLabel: { color: '#94a3b8' },
-        splitLine: { lineStyle: { color: 'rgba(99,102,241,0.1)' } },
+        splitLine: { lineStyle: { color: 'rgba(30,64,175,0.08)' } },
       },
       series: [
         {
           name: '任务数', type: 'line', data: taskCounts, smooth: true,
-          lineStyle: { color: '#6366f1', width: 2 },
-          itemStyle: { color: '#6366f1' },
+          lineStyle: { color: '#1e40af', width: 2 },
+          itemStyle: { color: '#1e40af' },
           areaStyle: {
             color: {
               type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
               colorStops: [
-                { offset: 0, color: 'rgba(99,102,241,0.3)' },
-                { offset: 1, color: 'rgba(99,102,241,0)' },
+                { offset: 0, color: 'rgba(30,64,175,0.25)' },
+                { offset: 1, color: 'rgba(30,64,175,0)' },
               ],
             },
           },
         },
         {
           name: '工单数', type: 'bar', data: ticketCounts,
-          itemStyle: { color: 'rgba(139,92,246,0.6)', borderRadius: [4, 4, 0, 0] },
+          itemStyle: { color: 'rgba(30,64,175,0.2)', borderRadius: [4, 4, 0, 0] },
         },
       ],
     })

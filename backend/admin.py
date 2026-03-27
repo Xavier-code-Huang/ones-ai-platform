@@ -76,14 +76,18 @@ async def get_overview(
                 COUNT(DISTINCT t.id) as total_tasks,
                 COALESCE(SUM(t.ticket_count), 0) as total_tickets,
                 COUNT(DISTINCT t.user_id) as unique_users,
-                COALESCE(AVG(t.total_duration), 0) as avg_duration,
+                COALESCE((
+                    SELECT AVG(tt.duration) FROM task_tickets tt
+                    JOIN tasks t2 ON t2.id = tt.task_id
+                    WHERE t2.created_at >= NOW() - ($1 || ' days')::INTERVAL
+                      AND tt.duration > 0
+                ), 0) as avg_duration,
                 CASE WHEN SUM(t.ticket_count) > 0
                     THEN SUM(t.success_count)::FLOAT / SUM(t.ticket_count)
                     ELSE 0 END as success_rate,
                 COALESCE(SUM(t.ticket_count), 0) * 2.0 as estimated_hours_saved
             FROM tasks t
             WHERE t.created_at >= NOW() - ($1 || ' days')::INTERVAL
-              AND t.status IN ('completed', 'failed')
         """, str(days))
 
     return OverviewStats(
@@ -119,7 +123,6 @@ async def get_trends(
                 COALESCE(SUM(ticket_count), 0) as tickets
             FROM tasks
             WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
-              AND status IN ('completed', 'failed')
             GROUP BY dt
             ORDER BY dt
         """, str(days))
@@ -143,13 +146,17 @@ async def get_user_rankings(
                 u.id as user_id, u.ones_email, u.display_name,
                 COUNT(t.id) as task_count,
                 COALESCE(SUM(t.ticket_count), 0) as ticket_count,
-                COALESCE(AVG(t.total_duration), 0) as avg_duration
+                COALESCE((
+                    SELECT AVG(tt.duration) FROM task_tickets tt
+                    WHERE tt.task_id IN (SELECT t2.id FROM tasks t2 WHERE t2.user_id = u.id
+                        AND t2.created_at >= NOW() - ($1 || ' days')::INTERVAL)
+                    AND tt.duration > 0
+                ), 0) as avg_duration
             FROM users u
             JOIN tasks t ON t.user_id = u.id
             WHERE t.created_at >= NOW() - ($1 || ' days')::INTERVAL
-              AND t.status IN ('completed', 'failed')
             GROUP BY u.id, u.ones_email, u.display_name
-            ORDER BY task_count DESC
+            ORDER BY ticket_count DESC
         """, str(days))
 
     return [
@@ -187,13 +194,17 @@ async def get_user_detail(
                 "SELECT ticket_id, ticket_title, note, status, duration, result_summary FROM task_tickets WHERE task_id=$1 ORDER BY seq_order",
                 t["id"],
             )
+            # running 任务 total_duration 为空，用已完成工单 duration 累加
+            duration = t["total_duration"]
+            if not duration or duration == 0:
+                duration = sum((tt["duration"] or 0) for tt in tickets)
             result.append({
                 "task_id": t["id"],
                 "server_name": t["server_name"],
                 "ticket_count": t["ticket_count"],
                 "success_count": t["success_count"],
                 "failed_count": t["failed_count"],
-                "total_duration": t["total_duration"],
+                "total_duration": duration,
                 "status": t["status"],
                 "created_at": str(t["created_at"]),
                 "tickets": [
@@ -226,7 +237,6 @@ async def get_user_trends(
             FROM tasks
             WHERE user_id=$1
               AND created_at >= NOW() - ($2 || ' days')::INTERVAL
-              AND status IN ('completed', 'failed')
             GROUP BY dt
             ORDER BY dt
         """, user_id, str(days))

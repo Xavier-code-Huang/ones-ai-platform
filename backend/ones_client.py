@@ -38,7 +38,7 @@ async def verify_ones_login(email: str, password: str) -> dict:
     logger.info(f"ONES 登录验证: email={email}")
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+        async with httpx.AsyncClient(verify=False, timeout=8) as client:
             resp = await client.post(
                 login_url,
                 json={"email": email, "password": password},

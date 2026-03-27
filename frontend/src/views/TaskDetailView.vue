@@ -41,7 +41,7 @@
         </div>
       </div>
       <div class="mini-stat">
-        <div class="mini-stat-icon" style="background:rgba(99,102,241,0.1);color:var(--accent-indigo);">⏱️</div>
+        <div class="mini-stat-icon" style="background:var(--accent-bg);color:var(--accent);">⏱️</div>
         <div>
           <span class="mini-stat-num">{{ task.total_duration?.toFixed(0) || 0 }}s</span>
           <span class="mini-stat-label">总耗时</span>
@@ -53,9 +53,24 @@
     <div class="glass-card fade-in-up" style="margin-top:16px;padding:16px 20px;" v-if="task.status==='running'">
       <el-progress :percentage="progress"
                    :stroke-width="8"
-                   :color="[{color:'#3b82f6',percentage:30},{color:'#6366f1',percentage:70},{color:'#22c55e',percentage:100}]" />
-      <p style="color:var(--text-muted);font-size:0.82rem;margin-top:8px;">任务正在执行中，请稍候...</p>
+                   :color="[{color:'#3b82f6',percentage:30},{color:'#1e40af',percentage:70},{color:'#22c55e',percentage:100}]" />
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
+        <p style="color:var(--text-muted);font-size:0.82rem;margin:0;">任务正在执行中，请稍候...</p>
+        <el-button size="small" type="warning" round @click="showTerminal = !showTerminal">
+          🖥️ {{ showTerminal ? '关闭终端' : '进入服务器' }}
+        </el-button>
+      </div>
     </div>
+
+    <!-- Web Terminal 面板 -->
+    <WebTerminal
+      v-if="task.status==='running'"
+      :task-id="Number(route.params.id)"
+      :visible="showTerminal"
+      :server-info="task.server_name || ''"
+      @close="showTerminal = false"
+      style="margin-top:12px;"
+    />
 
     <!-- 日志查看器 -->
     <div v-if="showLog" class="glass-card fade-in-up" style="margin-top:16px;">
@@ -80,85 +95,123 @@
     <el-button v-if="!showLog" size="small" @click="showLog=true;loadLogs()"
                style="margin-top:10px;" text type="primary" round>📄 查看执行日志</el-button>
 
-    <!-- 工单结果列表 -->
+    <!-- 双栏布局：工单列表 + 阶段时间线 -->
     <div style="margin-top:28px;">
       <h2 class="section-title fade-in-up">
         <span class="section-icon">🎯</span> 工单处理结果
       </h2>
-      <div v-for="(t, idx) in task.tickets||[]" :key="t.id"
-           class="glass-card ticket-result-card fade-in-up"
-           :style="{ animationDelay: (idx * 0.06) + 's', marginBottom: '14px' }">
-        <!-- 头部: 工单号 + 标题 + 状态 -->
-        <div class="ticket-header">
-          <div class="ticket-info">
-            <span class="ticket-num">{{ t.ticket_id }}</span>
-            <span v-if="t.ticket_title" class="ticket-title">{{ t.ticket_title }}</span>
-            <span :class="'badge badge-'+statusColor(t.status)">{{ statusLabel(t.status) }}</span>
-            <span v-if="t.duration" class="ticket-duration">{{ t.duration.toFixed(0) }}s</span>
-          </div>
-          <!-- 评价按钮 -->
-          <div v-if="t.status==='completed' || t.status==='failed'" class="eval-btns">
-            <template v-if="t.evaluation">
-              <span :class="t.evaluation.passed ? 'badge badge-success' : 'badge badge-danger'" style="padding:4px 12px;">
-                {{ t.evaluation.passed ? '✅ 已通过' : '❌ 未通过' }}
-              </span>
-              <el-button size="small" type="warning" @click="openRework(t)" round style="margin-left:8px;">
-                🔄 打回重做
-              </el-button>
-            </template>
-            <template v-else>
-              <el-button size="small" type="success" @click="evaluate(t, true)" circle>
-                <el-icon><Check /></el-icon>
-              </el-button>
-              <el-button size="small" type="danger" @click="evaluate(t, false)" circle>
-                <el-icon><Close /></el-icon>
-              </el-button>
-              <el-button size="small" type="warning" @click="openRework(t)" round style="margin-left:8px;">
-                🔄 打回重做
-              </el-button>
-            </template>
+      <div class="dual-panel">
+        <!-- 左栏: 工单卡片列表 -->
+        <div class="panel-left">
+          <TicketCard
+            v-for="t in task.tickets || []"
+            :key="t.id"
+            :ticket-id="t.ticket_id"
+            :ticket-db-id="t.id"
+            :status="t.status"
+            :conclusion="t.result_conclusion || ''"
+            :duration="t.duration || 0"
+            :is-active="selectedTicketId === t.id"
+            @select="selectTicket"
+            @edit="openEditTicket"
+            style="margin-bottom:8px;"
+          />
+          <div v-if="!task.tickets?.length" style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">
+            暂无工单数据
           </div>
         </div>
 
-        <!-- AI 结论 -->
-        <div v-if="t.result_conclusion" class="conclusion-bar">
-          <span class="conclusion-label">🤖 AI 结论</span>
-          <span v-html="renderMd(t.result_conclusion)"></span>
-        </div>
-
-        <!-- [FR-020] AI 处理详情（折叠区域） -->
-        <div v-if="t.result_analysis" class="analysis-section">
-          <div class="analysis-toggle" @click="t._showAnalysis = !t._showAnalysis">
-            <span class="toggle-icon">{{ t._showAnalysis ? '▼' : '▶' }}</span>
-            <span class="toggle-label">AI 处理详情</span>
-            <span class="toggle-hint" v-if="!t._showAnalysis">点击展开查看分析过程</span>
+        <!-- 右栏: 阶段时间线 + 工单详情 -->
+        <div class="panel-right">
+          <!-- 阶段时间线 -->
+          <div class="glass-card" style="padding:16px 18px;margin-bottom:14px;">
+            <div style="font-size:13px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:6px;">
+              ⏱️ 处理阶段
+              <span v-if="selectedTicket" style="color:var(--text-muted);font-weight:400;">- {{ selectedTicket.ticket_id }}</span>
+            </div>
+            <PhaseTimeline :phases="currentPhases" />
           </div>
-          <div v-if="t._showAnalysis" class="analysis-content" v-html="renderMd(t.result_analysis)"></div>
+
+          <!-- 工单详情（当前选中的工单） -->
+          <template v-if="selectedTicket">
+            <div class="glass-card ticket-result-card fade-in-up" style="margin-bottom:14px;">
+              <!-- 头部: 工单号 + 标题 + 状态 -->
+              <div class="ticket-header">
+                <div class="ticket-info">
+                  <span class="ticket-num">{{ selectedTicket.ticket_id }}</span>
+                  <span v-if="selectedTicket.ticket_title" class="ticket-title">{{ selectedTicket.ticket_title }}</span>
+                  <span :class="'badge badge-'+statusColor(selectedTicket.status)">{{ statusLabel(selectedTicket.status) }}</span>
+                  <span v-if="selectedTicket.duration" class="ticket-duration">{{ selectedTicket.duration.toFixed(0) }}s</span>
+                </div>
+                <!-- 评价按钮 -->
+                <div v-if="selectedTicket.status==='completed' || selectedTicket.status==='failed'" class="eval-btns">
+                  <template v-if="selectedTicket.evaluation">
+                    <span :class="selectedTicket.evaluation.passed ? 'badge badge-success' : 'badge badge-danger'" style="padding:4px 12px;">
+                      {{ selectedTicket.evaluation.passed ? '✅ 已通过' : '❌ 未通过' }}
+                    </span>
+                    <el-button size="small" type="warning" @click="openRework(selectedTicket)" round style="margin-left:8px;">
+                      🔄 打回重做
+                    </el-button>
+                  </template>
+                  <template v-else>
+                    <el-button size="small" type="success" @click="evaluate(selectedTicket, true)" circle>
+                      <el-icon><Check /></el-icon>
+                    </el-button>
+                    <el-button size="small" type="danger" @click="evaluate(selectedTicket, false)" circle>
+                      <el-icon><Close /></el-icon>
+                    </el-button>
+                    <el-button size="small" type="warning" @click="openRework(selectedTicket)" round style="margin-left:8px;">
+                      🔄 打回重做
+                    </el-button>
+                  </template>
+                </div>
+              </div>
+
+              <!-- AI 结论 -->
+              <div v-if="selectedTicket.result_conclusion" class="conclusion-bar">
+                <span class="conclusion-label">🤖 AI 结论</span>
+                <span v-html="renderMd(selectedTicket.result_conclusion)"></span>
+              </div>
+
+              <!-- AI 处理详情 -->
+              <div v-if="selectedTicket.result_analysis" class="analysis-section">
+                <div class="analysis-toggle" @click="selectedTicket._showAnalysis = !selectedTicket._showAnalysis">
+                  <span class="toggle-icon">{{ selectedTicket._showAnalysis ? '▼' : '▶' }}</span>
+                  <span class="toggle-label">AI 处理详情</span>
+                  <span class="toggle-hint" v-if="!selectedTicket._showAnalysis">点击展开查看分析过程</span>
+                </div>
+                <div v-if="selectedTicket._showAnalysis" class="analysis-content" v-html="renderMd(selectedTicket.result_analysis)"></div>
+              </div>
+
+              <!-- 补充说明 -->
+              <p v-if="selectedTicket.note" class="ticket-note">💬 {{ selectedTicket.note }}</p>
+
+              <!-- 分析摘要 -->
+              <div v-if="selectedTicket.result_summary && !selectedTicket.result_analysis" class="ticket-summary" v-html="renderMd(selectedTicket.result_summary)"></div>
+
+              <!-- 错误信息 -->
+              <div v-if="selectedTicket.error_message" class="ticket-error">
+                <el-icon><Warning /></el-icon> {{ selectedTicket.error_message }}
+              </div>
+
+              <!-- 操作按钮 -->
+              <div class="ticket-actions" v-if="selectedTicket.result_report || selectedTicket.report_path">
+                <el-button v-if="selectedTicket.result_report" size="small" type="primary" @click="viewReport(selectedTicket)" round>
+                  📄 查看详细报告
+                </el-button>
+                <span v-else-if="selectedTicket.report_path" class="report-path-hint">
+                  ⚠️ 报告路径: {{ selectedTicket.report_path }}（未能获取内容）
+                </span>
+              </div>
+
+              <!-- 内嵌报告 -->
+              <div v-if="selectedTicket._showReport && selectedTicket.result_report" class="report-inline" v-html="renderMd(selectedTicket.result_report)"></div>
+            </div>
+          </template>
+          <div v-else class="glass-card" style="padding:32px;text-align:center;color:var(--text-muted);font-size:13px;">
+            ← 点击左侧工单查看处理详情
+          </div>
         </div>
-
-        <!-- 补充说明 -->
-        <p v-if="t.note" class="ticket-note">💬 {{ t.note }}</p>
-
-        <!-- 分析摘要 -->
-        <div v-if="t.result_summary && !t.result_analysis" class="ticket-summary" v-html="renderMd(t.result_summary)"></div>
-
-        <!-- 错误信息 -->
-        <div v-if="t.error_message" class="ticket-error">
-          <el-icon><Warning /></el-icon> {{ t.error_message }}
-        </div>
-
-        <!-- 操作按钮 -->
-        <div class="ticket-actions" v-if="t.result_report || t.report_path">
-          <el-button v-if="t.result_report" size="small" type="primary" @click="viewReport(t)" round>
-            📄 查看详细报告
-          </el-button>
-          <span v-else-if="t.report_path" class="report-path-hint">
-            ⚠️ 报告路径: {{ t.report_path }}（未能获取内容）
-          </span>
-        </div>
-
-        <!-- 内嵌报告 -->
-        <div v-if="t._showReport && t.result_report" class="report-inline" v-html="renderMd(t.result_report)"></div>
       </div>
     </div>
 
@@ -187,15 +240,40 @@
         <el-button type="primary" @click="submitRework" :loading="reworkSubmitting">提交重做</el-button>
       </template>
     </el-dialog>
+
+    <!-- 编辑工单弹窗 -->
+    <el-dialog v-model="editDialogVisible" title="✏️ 编辑工单" width="500px" top="20vh">
+      <div v-if="editTicket" style="display:flex;flex-direction:column;gap:16px;">
+        <div>
+          <label style="font-size:13px;font-weight:600;margin-bottom:6px;display:block;">工单号</label>
+          <el-input :model-value="editTicket.ticket_id" disabled />
+        </div>
+        <div>
+          <label style="font-size:13px;font-weight:600;margin-bottom:6px;display:block;">代码路径</label>
+          <el-input v-model="editForm.code_directory" placeholder="代码目录绝对路径" />
+        </div>
+        <div>
+          <label style="font-size:13px;font-weight:600;margin-bottom:6px;display:block;">补充说明</label>
+          <el-input v-model="editForm.note" type="textarea" :rows="3" placeholder="对此工单的补充说明" />
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="editDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitEditTicket" :loading="editSubmitting">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
+import PhaseTimeline from '../components/PhaseTimeline.vue'
+import TicketCard from '../components/TicketCard.vue'
+import WebTerminal from '../components/WebTerminal.vue'
 
 const route = useRoute()
 const task = ref({})
@@ -207,11 +285,70 @@ const logLoading = ref(false)
 let ws = null
 let refreshInterval = null
 let _unmounted = false
+const showTerminal = ref(false)
 
 const progress = ref(0)
 const reportDialogVisible = ref(false)
 const reportContent = ref('')
 const reportLoading = ref(false)
+
+// 双栏状态
+const selectedTicketId = ref(null)
+const ticketPhasesMap = ref({}) // { ticketDbId: [phase1, phase2, ...] }
+
+const selectedTicket = computed(() => {
+  return (task.value.tickets || []).find(t => t.id === selectedTicketId.value) || null
+})
+
+const currentPhases = computed(() => {
+  return ticketPhasesMap.value[selectedTicketId.value] || []
+})
+
+function selectTicket(ticketDbId) {
+  selectedTicketId.value = ticketDbId
+  // 如果还没加载过 phase，从 API 拉取
+  if (!ticketPhasesMap.value[ticketDbId]) {
+    loadTicketPhases(ticketDbId)
+  }
+}
+
+async function loadTicketPhases(ticketDbId) {
+  try {
+    const res = await api.getTicketPhases(route.params.id, ticketDbId)
+    ticketPhasesMap.value[ticketDbId] = res.phases || []
+  } catch (e) {
+    // 旧任务无 phase 数据，兼容处理
+    ticketPhasesMap.value[ticketDbId] = []
+  }
+}
+
+// 编辑工单
+const editDialogVisible = ref(false)
+const editTicket = ref(null)
+const editForm = ref({ note: '', code_directory: '' })
+const editSubmitting = ref(false)
+
+function openEditTicket(ticketDbId) {
+  const t = (task.value.tickets || []).find(x => x.id === ticketDbId)
+  if (!t || t.status !== 'pending') return ElMessage.warning('只能编辑排队中的工单')
+  editTicket.value = t
+  editForm.value = { note: t.note || '', code_directory: t.code_directory || '' }
+  editDialogVisible.value = true
+}
+
+async function submitEditTicket() {
+  editSubmitting.value = true
+  try {
+    await api.editTicket(route.params.id, editTicket.value.id, editForm.value)
+    ElMessage.success('工单已更新')
+    editDialogVisible.value = false
+    await loadTask()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '更新失败')
+  } finally {
+    editSubmitting.value = false
+  }
+}
 
 function statusColor(s) {
   return { pending:'info', running:'warning', completed:'success', failed:'danger', cancelled:'info' }[s] || 'info'
@@ -270,12 +407,28 @@ function connectWs() {
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data)
     if (msg.type === 'log') {
-      logLines.value.push({ content: msg.content, type: msg.log_type || 'stdout' })
+      logLines.value.push({ content: msg.content, type: msg.log_type || 'stdout', phase: msg.phase_name || '' })
       if (autoScroll.value) nextTick(() => { if (logContainer.value) logContainer.value.scrollTop = logContainer.value.scrollHeight })
+    } else if (msg.type === 'phase_change') {
+      // 更新本地 phase 缓存
+      const dbId = msg.ticket_db_id
+      if (!ticketPhasesMap.value[dbId]) ticketPhasesMap.value[dbId] = []
+      const phases = ticketPhasesMap.value[dbId]
+      const idx = phases.findIndex(p => p.phase_name === msg.phase)
+      if (idx >= 0) {
+        phases[idx] = { ...phases[idx], status: msg.status, message: msg.message }
+      } else {
+        phases.push({ phase_name: msg.phase, phase_label: msg.phase_label, icon: msg.phase_icon, status: msg.status, message: msg.message })
+      }
+      ticketPhasesMap.value = { ...ticketPhasesMap.value } // 触发响应
+      // 自动选中第一个 running 的工单
+      if (!selectedTicketId.value) selectedTicketId.value = dbId
+    } else if (msg.type === 'phases_snapshot') {
+      ticketPhasesMap.value[msg.ticket_db_id] = msg.phases || []
+      ticketPhasesMap.value = { ...ticketPhasesMap.value }
     } else if (msg.type === 'complete') {
       loadTask()
     } else if (msg.type === 'progress') {
-      // debounce: 3 秒内只刷新一次，避免频繁重渲染关闭展开区域
       if (_progressTimer) clearTimeout(_progressTimer)
       _progressTimer = setTimeout(() => loadTask(), 3000)
     }
@@ -673,12 +826,32 @@ onUnmounted(() => {
   50% { opacity: 0.4; }
 }
 
+/* 双栏布局 */
+.dual-panel {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.panel-left {
+  max-height: calc(100vh - 300px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.panel-left::-webkit-scrollbar { width: 4px; }
+.panel-left::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+.panel-right {
+  min-width: 0;
+}
+
 @media (max-width: 768px) {
   .stats-row { grid-template-columns: repeat(2, 1fr); }
   .detail-header { flex-direction: column; gap: 12px; align-items: flex-start; }
+  .dual-panel { grid-template-columns: 1fr; }
+  .panel-left { max-height: none; }
 }
 
-/* 日志行分类 */
+/* 日志行分类 — 固定浅色（深色背景终端） */
 .log-line {
   padding: 2px 0;
   font-family: var(--font-mono);
@@ -686,10 +859,11 @@ onUnmounted(() => {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
+  color: #e2e8f0;
 }
-.log-system { color: var(--accent-blue); }
-.log-stderr { color: var(--danger); }
-.log-stdout { color: var(--text-primary); }
+.log-system { color: #38bdf8; }
+.log-stderr { color: #fb7185; }
+.log-stdout { color: #e2e8f0; }
 .log-tag {
   display: inline-block;
   padding: 0 5px;
@@ -699,6 +873,6 @@ onUnmounted(() => {
   margin-right: 6px;
   vertical-align: middle;
 }
-.log-tag.system { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
-.log-tag.stderr { background: var(--danger-bg); color: var(--danger); }
+.log-tag.system { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
+.log-tag.stderr { background: rgba(251, 113, 133, 0.15); color: #fb7185; }
 </style>

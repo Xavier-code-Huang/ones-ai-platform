@@ -112,34 +112,62 @@ async def require_admin(user: UserInfo = Depends(get_current_user)) -> UserInfo:
 async def login(req: LoginRequest):
     """
     用户登录 — 使用 ONES 邮箱 + 密码
-    1. 调用 ONES API 验证
-    2. 查找/创建本地用户
-    3. 生成 JWT 返回
+    优化: 首次 ONES 验证通过后缓存密码 hash，后续登录先验本地缓存
     """
-    # 1. ONES 验证
-    ones_user = None
-    try:
-        ones_user = await verify_ones_login(req.email, req.password)
-    except OnesClientError as e:
-        if settings.DEBUG:
-            # 开发模式: ONES API 不通时允许跳过验证
-            logger.warning(f"[DEV] ONES 验证失败({e.message})，开发模式允许跳过")
-            ones_user = {"name": req.email.split("@")[0], "uuid": "dev-mode"}
-        else:
-            raise HTTPException(status_code=401, detail=f"登录失败: {e.message}")
-    except Exception as e:
-        if settings.DEBUG:
-            logger.warning(f"[DEV] ONES API 连接失败({e})，开发模式允许跳过")
-            ones_user = {"name": req.email.split("@")[0], "uuid": "dev-mode"}
-        else:
-            raise HTTPException(status_code=401, detail=f"登录失败: ONES 服务不可用")
+    import hashlib
 
-    # 2. 查找或创建本地用户
+    # 0. 邮箱统一小写
+    email = req.email.strip().lower()
+    password_hash = hashlib.sha256(req.password.encode()).hexdigest()
+
+    # 1. 尝试本地密码缓存验证（跳过慢速 ONES API）
     pool = await get_pool()
+    ones_user = None
+    local_cache_hit = False
+
+    async with pool.acquire() as conn:
+        cached = await conn.fetchrow(
+            "SELECT id, display_name, role, password_hash FROM users WHERE ones_email=$1 AND is_active=TRUE",
+            email,
+        )
+        if cached and cached["password_hash"] and cached["password_hash"] == password_hash:
+            # ✅ 本地缓存命中 — 无需调用 ONES API
+            local_cache_hit = True
+            ones_user = {"name": cached["display_name"] or email.split("@")[0], "uuid": "cached"}
+            logger.info(f"登录缓存命中: {email} (跳过 ONES API)")
+
+    # 2. 缓存未命中 → 走 ONES API 验证
+    if not local_cache_hit:
+        try:
+            ones_user = await verify_ones_login(email, req.password)
+        except OnesClientError as e:
+            if settings.DEBUG:
+                logger.warning(f"[DEV] ONES 验证失败({e.message})，开发模式允许跳过")
+                ones_user = {"name": email.split("@")[0], "uuid": "dev-mode"}
+            else:
+                raise HTTPException(status_code=401, detail=f"登录失败: {e.message}")
+        except Exception as e:
+            if settings.DEBUG:
+                logger.warning(f"[DEV] ONES API 连接失败({e})，开发模式允许跳过")
+                ones_user = {"name": email.split("@")[0], "uuid": "dev-mode"}
+            else:
+                # ONES 超时/不可用 → 尝试用本地缓存兜底
+                if cached and cached["password_hash"]:
+                    logger.warning(f"ONES 不可用，尝试本地缓存验证: {email}")
+                    if cached["password_hash"] == password_hash:
+                        local_cache_hit = True
+                        ones_user = {"name": cached["display_name"] or email.split("@")[0], "uuid": "cached-fallback"}
+                        logger.info(f"ONES 不可用，缓存验证成功: {email}")
+                    else:
+                        raise HTTPException(status_code=401, detail="密码错误 (ONES 服务暂时不可用)")
+                else:
+                    raise HTTPException(status_code=401, detail=f"登录失败: ONES 服务不可用")
+
+    # 3. 查找或创建本地用户 + 更新密码缓存
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, ones_email, display_name, role FROM users WHERE ones_email=$1",
-            req.email,
+            email,
         )
         if row:
             user_id = row["id"]
@@ -149,32 +177,35 @@ async def login(req: LoginRequest):
             ones_name = ones_user.get("name", "")
             # DEBUG 模式的假名字（如 "yixiang.huang"）不应覆盖数据库中已有的中文名
             update_name = ones_name if (ones_name and ones_name != "dev-mode"
-                                        and not ones_name.endswith(req.email.split("@")[0])) else display_name
+                                        and not ones_name.endswith(email.split("@")[0])) else display_name
+            final_name = update_name or display_name
             await conn.execute(
-                "UPDATE users SET display_name=$1, last_login_at=NOW(), updated_at=NOW() WHERE id=$2",
-                update_name or display_name,
+                "UPDATE users SET display_name=$1, password_hash=$2, last_login_at=NOW(), updated_at=NOW() WHERE id=$3",
+                final_name, password_hash,
                 user_id,
             )
+            display_name = final_name  # 确保返回值也是更新后的名字
         else:
             # 新用户
             display_name = ones_user.get("name", "")
             user_id = await conn.fetchval(
-                """INSERT INTO users (ones_email, display_name, role, last_login_at)
-                   VALUES ($1, $2, 'user', NOW()) RETURNING id""",
-                req.email,
+                """INSERT INTO users (ones_email, display_name, role, password_hash, last_login_at)
+                   VALUES ($1, $2, 'user', $3, NOW()) RETURNING id""",
+                email,
                 display_name,
+                password_hash,
             )
             role = "user"
 
     # 3. 生成 Token
-    token = create_token(user_id, req.email, role)
-    logger.info(f"用户登录成功: {req.email} (id={user_id})")
+    token = create_token(user_id, email, role)
+    logger.info(f"用户登录成功: {email} (id={user_id}, name={display_name})")
 
     return TokenResponse(
         token=token,
         user=UserInfo(
             id=user_id,
-            ones_email=req.email,
+            ones_email=email,
             display_name=display_name,
             role=role,
         ),

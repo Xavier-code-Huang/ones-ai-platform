@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS servers (
     description     TEXT DEFAULT '',
     status          VARCHAR(20) DEFAULT 'unknown',
     has_ones_ai     BOOLEAN DEFAULT TRUE,
+    is_enabled      BOOLEAN DEFAULT TRUE,
     last_health_at  TIMESTAMP,
     created_at      TIMESTAMP DEFAULT NOW(),
     updated_at      TIMESTAMP DEFAULT NOW()
@@ -228,6 +229,101 @@ COMMENT ON TABLE external_configs IS '外部服务配置（ONES/Gerrit/企微等
 INSERT INTO users (ones_email, display_name, role)
 VALUES ('admin@ones-ai.local', '管理员', 'admin')
 ON CONFLICT (ones_email) DO NOTHING;
+
+-- ============================================================
+--  user_agent_dirs  用户 Agent 目录记忆表
+-- ============================================================
+CREATE TABLE IF NOT EXISTS user_agent_dirs (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    server_id       INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    credential_id   INTEGER NOT NULL REFERENCES user_server_credentials(id) ON DELETE CASCADE,
+    agent_dir       TEXT NOT NULL,
+    updated_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE(user_id, server_id, credential_id)
+);
+COMMENT ON TABLE user_agent_dirs IS '用户在每台服务器每组凭证上的 Agent Teams 目录记忆';
+
+-- ============================================================
+--  external_teams  外部团队注册表
+-- ============================================================
+CREATE TABLE IF NOT EXISTS external_teams (
+    id              SERIAL PRIMARY KEY,
+    team_name       VARCHAR(100) UNIQUE NOT NULL,
+    api_key         VARCHAR(64) UNIQUE NOT NULL,
+    description     TEXT DEFAULT '',
+    contact_email   VARCHAR(200) DEFAULT '',
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+COMMENT ON TABLE external_teams IS '外部团队注册表，每个团队一个API Key';
+
+-- ============================================================
+--  external_team_members  外部团队成员表
+-- ============================================================
+CREATE TABLE IF NOT EXISTS external_team_members (
+    id              SERIAL PRIMARY KEY,
+    team_id         INTEGER NOT NULL REFERENCES external_teams(id) ON DELETE CASCADE,
+    member_name     VARCHAR(100) NOT NULL,
+    member_email    VARCHAR(200) DEFAULT '',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(team_id, member_name)
+);
+COMMENT ON TABLE external_team_members IS '外部团队成员表';
+
+-- ============================================================
+--  external_logs  外部日志上报表
+-- ============================================================
+CREATE TABLE IF NOT EXISTS external_logs (
+    id              SERIAL PRIMARY KEY,
+    team_id         INTEGER NOT NULL REFERENCES external_teams(id) ON DELETE CASCADE,
+    member_name     VARCHAR(100) NOT NULL,
+    ticket_id       VARCHAR(50) DEFAULT '',
+    action_type     VARCHAR(50) DEFAULT 'process',
+    status          VARCHAR(20) DEFAULT 'completed',
+    duration        FLOAT DEFAULT 0,
+    summary         TEXT DEFAULT '',
+    extra_data      JSONB DEFAULT '{}',
+    reported_at     TIMESTAMPTZ DEFAULT NOW()
+);
+COMMENT ON TABLE external_logs IS '外部团队日志上报记录';
+CREATE INDEX IF NOT EXISTS idx_external_logs_team_id ON external_logs(team_id);
+CREATE INDEX IF NOT EXISTS idx_external_logs_reported_at ON external_logs(reported_at);
+
+-- ============================================================
+--  task_ticket_phases  工单处理阶段表 [FR-101, FR-103]
+-- ============================================================
+CREATE TABLE IF NOT EXISTS task_ticket_phases (
+    id              SERIAL PRIMARY KEY,
+    task_ticket_id  INTEGER NOT NULL REFERENCES task_tickets(id) ON DELETE CASCADE,
+    phase_name      VARCHAR(50) NOT NULL,
+    phase_label     VARCHAR(100) NOT NULL,
+    phase_order     INTEGER NOT NULL DEFAULT 0,
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+    message         TEXT DEFAULT '',
+    started_at      TIMESTAMP WITH TIME ZONE,
+    completed_at    TIMESTAMP WITH TIME ZONE,
+    duration_ms     INTEGER,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ttp_ticket ON task_ticket_phases(task_ticket_id);
+COMMENT ON TABLE task_ticket_phases IS '工单处理阶段记录，用于前端时间线展示';
+
+-- ============================================================
+--  user_code_paths  用户代码目录历史记忆表 [FR-107]
+-- ============================================================
+CREATE TABLE IF NOT EXISTS user_code_paths (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    server_id       INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    path            VARCHAR(500) NOT NULL,
+    use_count       INTEGER DEFAULT 1,
+    last_used_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(user_id, server_id, path)
+);
+COMMENT ON TABLE user_code_paths IS '用户在每台服务器上使用过的代码目录历史';
 """
 
 
@@ -237,6 +333,8 @@ ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS ticket_title TEXT DEFAULT '';
 ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS result_conclusion TEXT DEFAULT '';
 ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS report_path TEXT DEFAULT '';
 ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS result_analysis TEXT DEFAULT '';
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS phase_name VARCHAR(50) DEFAULT '';
 """
 
 
@@ -247,4 +345,4 @@ async def init_db():
         await conn.execute(INIT_SQL)
         # 执行迁移（新增列，兼容已有表）
         await conn.execute(MIGRATION_SQL)
-    logger.info("数据库初始化完成（8 张表 + 迁移）")
+    logger.info("数据库初始化完成（14 张表 + 迁移）")

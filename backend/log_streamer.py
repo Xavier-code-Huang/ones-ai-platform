@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 @Description: ones-AI 平台 — WebSocket 日志流
-@Version: 1.0.0
-@Date: 2026-03-17
+@Version: 2.0.0
+@Date: 2026-03-26
 
-关联设计文档: §4.6 日志流模块
-关联需求: FR-006
+关联设计文档: §4.6 日志流模块, §3.3 WebSocket 协议扩展
+关联需求: FR-006, FR-103
 """
 
 import logging
@@ -15,6 +15,7 @@ from jose import JWTError, jwt
 from config import settings
 from database import get_pool
 from task_executor import subscribe_logs, unsubscribe_logs
+from phases import get_phases
 
 logger = logging.getLogger("ones-ai.ws")
 router = APIRouter(tags=["WebSocket"])
@@ -25,6 +26,11 @@ async def task_log_stream(websocket: WebSocket, task_id: int, token: str = Query
     """
     WebSocket 日志流端点
     连接: ws://host/ws/tasks/{task_id}/logs?token=<JWT>
+
+    推送消息类型:
+    - log: 执行日志
+    - phase_change: 阶段状态变更
+    - pong: 心跳回复
     """
     # Token 验证
     try:
@@ -51,16 +57,33 @@ async def task_log_stream(websocket: WebSocket, task_id: int, token: str = Query
     # 发送历史日志
     async with pool.acquire() as conn:
         logs = await conn.fetch(
-            "SELECT content, log_type, timestamp FROM task_logs WHERE task_id=$1 ORDER BY id",
+            "SELECT content, log_type, phase_name, timestamp FROM task_logs WHERE task_id=$1 ORDER BY id",
             task_id,
         )
-    for log in logs:
+    for log_entry in logs:
         await websocket.send_json({
             "type": "log",
-            "content": log["content"],
-            "log_type": log["log_type"],
-            "timestamp": str(log["timestamp"]),
+            "content": log_entry["content"],
+            "log_type": log_entry["log_type"],
+            "phase_name": log_entry["phase_name"] or "",
+            "timestamp": str(log_entry["timestamp"]),
         })
+
+    # 发送历史阶段数据
+    async with pool.acquire() as conn:
+        tickets = await conn.fetch(
+            "SELECT id, ticket_id FROM task_tickets WHERE task_id=$1 ORDER BY seq_order",
+            task_id,
+        )
+    for ticket in tickets:
+        phases = await get_phases(ticket["id"])
+        if phases:
+            await websocket.send_json({
+                "type": "phases_snapshot",
+                "ticket_id": ticket["ticket_id"],
+                "ticket_db_id": ticket["id"],
+                "phases": phases,
+            })
 
     # 订阅实时日志
     subscribe_logs(task_id, websocket)

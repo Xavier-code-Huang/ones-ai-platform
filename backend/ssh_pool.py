@@ -38,7 +38,7 @@ async def get_ssh_connection(
     key = _make_key(host, port, username)
     async with _lock:
         conn = _connections.get(key)
-        if conn and not conn.is_closed():
+        if conn and _is_alive(conn):
             return conn
 
         # 创建新连接
@@ -100,11 +100,26 @@ async def verify_ssh_credential(
         return {"success": False, "has_ones_ai": False, "message": f"验证失败: {e}"}
 
 
+def _is_alive(conn: asyncssh.SSHClientConnection) -> bool:
+    """检查 SSH 连接是否存活（兼容不同版本 asyncssh）"""
+    try:
+        if hasattr(conn, 'is_closed'):
+            return not conn.is_closed()
+        # 旧版 asyncssh 没有 is_closed，检查内部属性
+        if hasattr(conn, '_transport'):
+            return conn._transport is not None and not conn._transport.is_closing()
+        return True  # 无法判断，假设存活
+    except Exception:
+        return False
+
+
 async def close_all_connections():
     """关闭所有 SSH 连接"""
     async with _lock:
         for key, conn in _connections.items():
-            if not conn.is_closed():
+            try:
                 conn.close()
+            except Exception:
+                pass
         _connections.clear()
         logger.info("所有 SSH 连接已关闭")

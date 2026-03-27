@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from database import init_db, close_pool, get_pool
 from task_executor import task_worker
+from task_watchdog import watchdog_loop
 
 # 配置日志
 logging.basicConfig(
@@ -26,21 +27,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ones-ai")
 
-# Worker 任务引用
+# Worker / Watchdog 任务引用
 _worker_task = None
+_watchdog_task = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global _worker_task
+    global _worker_task, _watchdog_task
 
     # 启动
     logger.info(f"ones-AI Platform {settings.APP_VERSION} 启动中...")
     await init_db()
     await _init_default_configs()
     _worker_task = asyncio.create_task(task_worker())
-    logger.info("✅ 所有服务已启动")
+    _watchdog_task = asyncio.create_task(watchdog_loop())
+    logger.info("✅ 所有服务已启动（含 Watchdog）")
 
     yield
 
@@ -48,6 +51,8 @@ async def lifespan(app: FastAPI):
     logger.info("正在关闭...")
     if _worker_task:
         _worker_task.cancel()
+    if _watchdog_task:
+        _watchdog_task.cancel()
     await close_pool()
     from ssh_pool import close_all_connections
     await close_all_connections()
@@ -78,6 +83,9 @@ from tasks import router as tasks_router
 from log_streamer import router as ws_router
 from evaluations import router as eval_router
 from admin import router as admin_router
+from external import router as external_router
+from ones_preview import router as preview_router
+from terminal_ws import router as terminal_router
 
 app.include_router(auth_router)
 app.include_router(servers_router)
@@ -85,6 +93,9 @@ app.include_router(tasks_router)
 app.include_router(ws_router)
 app.include_router(eval_router)
 app.include_router(admin_router)
+app.include_router(external_router)
+app.include_router(preview_router)
+app.include_router(terminal_router)
 
 
 @app.get("/")
@@ -136,6 +147,15 @@ async def _init_default_configs():
         ("wecom_agent_id", str(settings.WECOM_AGENT_ID), False, "企业微信 Agent ID"),
         ("wecom_secret", settings.WECOM_SECRET, True, "企业微信 Secret"),
         ("wecom_webhook_url", settings.WECOM_WEBHOOK_URL, False, "企业微信 Webhook URL"),
+        # 通知开关
+        ("notify_webhook_enabled", str(settings.NOTIFY_WEBHOOK_ENABLED).lower(), False, "Webhook 通知开关"),
+        ("notify_email_enabled", str(settings.NOTIFY_EMAIL_ENABLED).lower(), False, "邮件通知开关"),
+        # SMTP
+        ("smtp_host", settings.SMTP_HOST, False, "SMTP 服务器地址"),
+        ("smtp_port", str(settings.SMTP_PORT), False, "SMTP 端口"),
+        ("smtp_user", settings.SMTP_USER, False, "SMTP 发件邮箱"),
+        ("smtp_pass", settings.SMTP_PASS, True, "SMTP 授权密码"),
+        ("smtp_from_name", settings.SMTP_FROM_NAME, False, "邮件发件人显示名"),
     ]
 
     pool = await get_pool()

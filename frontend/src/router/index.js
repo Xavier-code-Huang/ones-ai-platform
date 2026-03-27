@@ -3,6 +3,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 const routes = [
   { path: '/login', name: 'Login', component: () => import('../views/LoginView.vue'), meta: { guest: true } },
   { path: '/', name: 'Dashboard', component: () => import('../views/DashboardView.vue'), meta: { auth: true } },
+  { path: '/tasks', name: 'TaskList', component: () => import('../views/TaskListView.vue'), meta: { auth: true } },
   { path: '/tasks/new/:serverId?', name: 'NewTask', component: () => import('../views/TaskView.vue'), meta: { auth: true } },
   { path: '/tasks/:id', name: 'TaskDetail', component: () => import('../views/TaskDetailView.vue'), meta: { auth: true } },
   { path: '/admin', name: 'Admin', component: () => import('../views/AdminView.vue'), meta: { auth: true, admin: true } },
@@ -11,6 +12,8 @@ const routes = [
   { path: '/admin/users/:id', name: 'AdminUserDetail', component: () => import('../views/AdminUserDetail.vue'), meta: { auth: true, admin: true } },
   { path: '/admin/eval', name: 'AdminEval', component: () => import('../views/AdminEval.vue'), meta: { auth: true, admin: true } },
   { path: '/admin/configs', name: 'AdminConfigs', component: () => import('../views/AdminConfigs.vue'), meta: { auth: true, admin: true } },
+  { path: '/admin/servers', name: 'AdminServers', component: () => import('../views/AdminServers.vue'), meta: { auth: true, admin: true } },
+  { path: '/admin/external', name: 'AdminExternalTeams', component: () => import('../views/AdminExternalTeams.vue'), meta: { auth: true, admin: true } },
 ]
 
 const router = createRouter({ history: createWebHistory(), routes })

@@ -279,27 +279,13 @@ function formatCredTime(t) {
 <style scoped>
 /* 欢迎横幅 */
 .welcome-banner {
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(59, 130, 246, 0.08) 50%, rgba(168, 85, 247, 0.06) 100%);
-  border: 1px solid rgba(99, 102, 241, 0.15);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 32px 36px;
   position: relative;
   overflow: hidden;
-}
-.welcome-banner::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.3), rgba(168, 85, 247, 0.2), transparent);
-}
-.welcome-banner::after {
-  content: '';
-  position: absolute;
-  top: -50%; right: -10%;
-  width: 300px; height: 300px;
-  background: radial-gradient(circle, rgba(99, 102, 241, 0.08) 0%, transparent 70%);
-  pointer-events: none;
+  box-shadow: var(--shadow-sm);
 }
 .welcome-content {
   display: flex;
@@ -311,10 +297,7 @@ function formatCredTime(t) {
 .welcome-text h1 {
   font-size: 1.5rem;
   font-weight: 700;
-  background: linear-gradient(135deg, var(--text-primary), var(--accent-light));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: var(--text-primary);
 }
 .welcome-text p {
   color: var(--text-secondary);
@@ -331,10 +314,7 @@ function formatCredTime(t) {
   display: block;
   font-size: 1.8rem;
   font-weight: 800;
-  background: var(--accent-gradient);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: var(--accent);
   line-height: 1.1;
 }
 .quick-stat-label {
@@ -382,8 +362,8 @@ function formatCredTime(t) {
   border-radius: 50%;
   flex-shrink: 0;
 }
-.dot-online { background: var(--success); box-shadow: 0 0 8px rgba(34, 197, 94, 0.4); }
-.dot-offline { background: var(--danger); box-shadow: 0 0 8px rgba(239, 68, 68, 0.3); }
+.dot-online { background: var(--success); box-shadow: 0 0 6px rgba(5, 150, 105, 0.3); }
+.dot-offline { background: var(--danger); box-shadow: 0 0 6px rgba(220, 38, 38, 0.3); }
 .dot-unknown { background: var(--text-muted); }
 .server-meta { font-size: 0.88rem; }
 .server-host { color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.82rem; }
@@ -399,15 +379,15 @@ function formatCredTime(t) {
   justify-content: space-between;
   align-items: center;
 }
-.task-row:hover { border-color: var(--border-active); }
+.task-row:hover { border-color: var(--border-hover); box-shadow: var(--shadow); transform: translateY(-1px); }
 .task-row-left { display: flex; align-items: center; gap: 12px; }
-.task-id { font-weight: 700; font-size: 1rem; color: var(--accent-light); font-family: var(--font-mono); }
+.task-id { font-weight: 700; font-size: 1rem; color: var(--accent); font-family: var(--font-mono); }
 .task-server { color: var(--text-secondary); font-size: 0.9rem; }
 .task-row-right { display: flex; align-items: center; gap: 16px; }
 .task-tickets { color: var(--text-secondary); font-size: 0.85rem; }
 .task-time { color: var(--text-muted); font-size: 0.82rem; }
-.task-arrow { color: var(--text-muted); transition: transform 0.2s; }
-.task-row:hover .task-arrow { transform: translateX(3px); color: var(--accent-light); }
+.task-arrow { color: var(--text-muted); transition: all 0.2s var(--ease); }
+.task-row:hover .task-arrow { transform: translateX(3px); color: var(--accent); }
 
 /* 空状态 */
 .empty-state {
@@ -429,12 +409,12 @@ function formatCredTime(t) {
 .cred-item {
   display: flex; justify-content: space-between; align-items: center;
   padding: 12px 16px;
-  background: rgba(255,255,255,0.03);
+  background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  transition: border-color 0.2s;
+  transition: border-color 0.2s var(--ease);
 }
-.cred-item:hover { border-color: var(--border-active); }
+.cred-item:hover { border-color: var(--border-hover); }
 .cred-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .cred-username {
   font-weight: 700; font-size: 0.95rem;
@@ -443,14 +423,14 @@ function formatCredTime(t) {
 }
 .cred-alias {
   font-size: 0.82rem; color: var(--text-muted);
-  background: rgba(99,102,241,0.1);
+  background: var(--accent-bg);
   padding: 2px 8px; border-radius: 10px;
 }
 .cred-status {
   font-size: 0.75rem; padding: 2px 8px; border-radius: 10px; font-weight: 600;
 }
-.cred-status.verified { color: var(--success); background: rgba(34,197,94,0.1); }
-.cred-status.unverified { color: var(--warning); background: rgba(245,158,11,0.1); }
+.cred-status.verified { color: var(--success); background: var(--success-bg); }
+.cred-status.unverified { color: var(--warning); background: var(--warning-bg); }
 .cred-time { font-size: 0.78rem; color: var(--text-muted); }
 .cred-empty {
   text-align: center; padding: 32px 16px;
