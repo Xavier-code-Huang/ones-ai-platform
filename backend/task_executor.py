@@ -163,9 +163,18 @@ async def _execute_task(task_id: int):
                 logger.error(f"任务 {task_id} 不存在")
                 return
 
-            if task["status"] in ("completed", "failed", "cancelled"):
+            if task["status"] in ("cancelled",):
                 logger.warning(f"任务 {task_id} 状态为 {task['status']}，跳过")
                 return
+            # 允许 completed/failed 任务重新执行（打回重做场景：rework API 已插入新pending工单）
+            if task["status"] in ("completed", "failed"):
+                has_pending = await conn.fetchval(
+                    "SELECT count(*) FROM task_tickets WHERE task_id=$1 AND status='pending'",
+                    task_id)
+                if not has_pending:
+                    logger.info(f"任务 {task_id} 状态为 {task['status']} 且无pending工单，跳过")
+                    return
+                logger.info(f"任务 {task_id} 状态为 {task['status']} 但有 {has_pending} 个pending工单（打回重做），继续执行")
 
             # 更新状态为 running（保留已有 started_at，防止重启覆盖）
             await conn.execute(
@@ -588,13 +597,16 @@ async def _execute_task(task_id: int):
         else:
             final_status = "completed"
 
+        # 只在任务仍为 running 时更新终态（防止覆盖 rework API 已设回的 pending 状态）
         async with pool.acquire() as conn:
-            await conn.execute("""
+            updated = await conn.execute("""
                 UPDATE tasks SET
                     status=$1, success_count=$2, failed_count=$3,
                     total_duration=$4, completed_at=NOW()
-                WHERE id=$5
+                WHERE id=$5 AND status='running'
             """, final_status, db_done, db_fail, total_duration, task_id)
+            if 'UPDATE 0' in str(updated):
+                logger.warning(f"任务 {task_id} 状态已非running（可能被rework修改），跳过终态更新")
 
         # 广播完成
         await _broadcast_log(task_id, {
