@@ -345,6 +345,12 @@ async def _execute_task(task_id: int):
                         if _m:
                             container_name = _m.group(1)
                             logger.info(f"捕获容器名: {container_name}")
+                            # 立即将容器名保存到数据库，供终端连接使用
+                            async with pool.acquire() as conn:
+                                await conn.execute(
+                                    "UPDATE task_tickets SET container_name=$1 WHERE id=$2",
+                                    container_name, db_id
+                                )
 
                     # 解析 [PHASE] 标记行（由 runner 输出）
                     if line.startswith("[PHASE]"):
@@ -625,12 +631,31 @@ async def _execute_task(task_id: int):
             logger.warning(f"通知发送失败: {e}")
 
     except Exception as e:
-        logger.error(f"任务 {task_id} 执行异常: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"任务 {task_id} 执行异常: {type(e).__name__}: {e}\n{tb}")
+        try:
+            error_detail = f"任务执行异常: {type(e).__name__}: {e}"
+            await _save_log(task_id, error_detail, "system")
+            await _broadcast_log(task_id, {
+                "type": "complete", "status": "failed",
+                "message": error_detail,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            pass
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE tasks SET status='failed', completed_at=NOW() WHERE id=$1",
                 task_id,
             )
+            # 同步清理：将所有 pending/running 工单标为 failed（防止工单永远卡住）
+            await conn.execute("""
+                UPDATE task_tickets SET status='failed',
+                    error_message=COALESCE(error_message, $1),
+                    completed_at=NOW()
+                WHERE task_id=$2 AND status IN ('pending', 'running')
+            """, f"任务执行异常: {type(e).__name__}: {e}", task_id)
 
 
 async def _download_single_report(ssh_conn, pool, db_id: int, container_name: str = ""):
