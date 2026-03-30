@@ -86,6 +86,7 @@ from admin import router as admin_router
 from external import router as external_router
 from ones_preview import router as preview_router
 from terminal_ws import router as terminal_router
+from accuracy_api import router as accuracy_router
 
 app.include_router(auth_router)
 app.include_router(servers_router)
@@ -96,6 +97,7 @@ app.include_router(admin_router)
 app.include_router(external_router)
 app.include_router(preview_router)
 app.include_router(terminal_router)
+app.include_router(accuracy_router)
 
 
 @app.get("/")

@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS task_tickets (
     ticket_id       VARCHAR(50) NOT NULL,
     note            TEXT DEFAULT '',
     code_directory  TEXT DEFAULT '',
+    container_name  VARCHAR(255) DEFAULT '',
     extra_mounts    TEXT DEFAULT '',
     compile_command TEXT DEFAULT '',
     run_tests       BOOLEAN DEFAULT FALSE,
@@ -324,6 +325,34 @@ CREATE TABLE IF NOT EXISTS user_code_paths (
     UNIQUE(user_id, server_id, path)
 );
 COMMENT ON TABLE user_code_paths IS '用户在每台服务器上使用过的代码目录历史';
+
+-- ============================================================
+--  accuracy_evaluations  准确度评测结果表 [FR-200]
+-- ============================================================
+CREATE TABLE IF NOT EXISTS accuracy_evaluations (
+    id              SERIAL PRIMARY KEY,
+    task_ticket_id  INTEGER UNIQUE NOT NULL REFERENCES task_tickets(id) ON DELETE CASCADE,
+    ticket_id       VARCHAR(50) NOT NULL,
+    gerrit_change_id    VARCHAR(100) DEFAULT '',
+    gerrit_change_url   TEXT DEFAULT '',
+    gerrit_files        JSONB DEFAULT '[]',
+    gerrit_diff_summary TEXT DEFAULT '',
+    gerrit_commit_msg   TEXT DEFAULT '',
+    score_file_match    INTEGER DEFAULT 0,
+    score_root_cause    INTEGER DEFAULT 0,
+    score_fix_similar   INTEGER DEFAULT 0,
+    score_actionable    INTEGER DEFAULT 0,
+    score_consistency   INTEGER DEFAULT 0,
+    total_score         INTEGER DEFAULT 0,
+    is_effective        BOOLEAN DEFAULT FALSE,
+    llm_reasoning       TEXT DEFAULT '',
+    skip_reason         TEXT DEFAULT '',
+    eval_version        VARCHAR(20) DEFAULT 'v1',
+    evaluated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ae_ticket ON accuracy_evaluations(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_ae_effective ON accuracy_evaluations(is_effective);
+COMMENT ON TABLE accuracy_evaluations IS '准确度评测结果：五维度评分 + Gerrit 关联数据';
 """
 
 
@@ -333,6 +362,7 @@ ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS ticket_title TEXT DEFAULT '';
 ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS result_conclusion TEXT DEFAULT '';
 ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS report_path TEXT DEFAULT '';
 ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS result_analysis TEXT DEFAULT '';
+ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS container_name VARCHAR(255) DEFAULT '';
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS phase_name VARCHAR(50) DEFAULT '';
 """
@@ -345,4 +375,4 @@ async def init_db():
         await conn.execute(INIT_SQL)
         # 执行迁移（新增列，兼容已有表）
         await conn.execute(MIGRATION_SQL)
-    logger.info("数据库初始化完成（14 张表 + 迁移）")
+    logger.info("数据库初始化完成（15 张表 + 迁移）")
