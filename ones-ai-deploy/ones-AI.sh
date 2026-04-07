@@ -161,12 +161,70 @@ case "$WORK_DIR" in
     *) MOUNT_ARGS+=(-v "${WORK_DIR}:${WORK_DIR}") ;;
 esac
 
+# ---- 解析 --agent-dir / --extra-mounts / --code-dirs 用于Docker挂载 ----
+ARGS_ARRAY=("$@")   # 必须在此处初始化，后面解析依赖此变量
+AGENT_DIR=""
+EXTRA_MOUNTS=""
+CODE_DIRS=()
+for i in "${!ARGS_ARRAY[@]}"; do
+    case "${ARGS_ARRAY[$i]}" in
+        --agent-dir)
+            next=$((i + 1))
+            [ $next -lt ${#ARGS_ARRAY[@]} ] && AGENT_DIR="${ARGS_ARRAY[$next]}"
+            ;;
+        --extra-mounts)
+            next=$((i + 1))
+            [ $next -lt ${#ARGS_ARRAY[@]} ] && EXTRA_MOUNTS="${ARGS_ARRAY[$next]}"
+            ;;
+        --code-dirs)
+            # 收集 --code-dirs 后面所有非 -- 开头的参数
+            j=$((i + 1))
+            while [ $j -lt ${#ARGS_ARRAY[@]} ] && [[ "${ARGS_ARRAY[$j]}" != --* ]]; do
+                CODE_DIRS+=("${ARGS_ARRAY[$j]}")
+                j=$((j + 1))
+            done
+            ;;
+    esac
+done
+
+# Agent 目录挂载（只读）
+if [[ -n "$AGENT_DIR" ]]; then
+    # 解析真实路径
+    AGENT_DIR_REAL=$(readlink -f "$AGENT_DIR" 2>/dev/null || echo "$AGENT_DIR")
+    case "$AGENT_DIR_REAL" in
+        "${USER_HOME}"*|"${WORK_DIR}"*) ;;
+        *) MOUNT_ARGS+=(-v "${AGENT_DIR_REAL}:${AGENT_DIR_REAL}:ro") ;;
+    esac
+fi
+
+# 代码目录挂载（读写）
+for cd_path in "${CODE_DIRS[@]}"; do
+    [[ -z "$cd_path" ]] && continue
+    cd_real=$(readlink -f "$cd_path" 2>/dev/null || echo "$cd_path")
+    case "$cd_real" in
+        "${USER_HOME}"*|"${WORK_DIR}"*) ;;
+        *) MOUNT_ARGS+=(-v "${cd_real}:${cd_real}") ;;
+    esac
+done
+
+# 额外挂载路径（逗号分隔）
+if [[ -n "$EXTRA_MOUNTS" ]]; then
+    IFS=',' read -ra MOUNT_LIST <<< "$EXTRA_MOUNTS"
+    for mp in "${MOUNT_LIST[@]}"; do
+        mp="${mp// /}"
+        [[ -z "$mp" ]] && continue
+        case "$mp" in
+            "${USER_HOME}"*|"${WORK_DIR}"*) ;;
+            *) MOUNT_ARGS+=(-v "${mp}:${mp}") ;;
+        esac
+    done
+fi
+
 # ---- 处理Excel文件 ----
 # --excel 指定的文件需要确保容器内可访问
 # 如果文件在已挂载的目录内，不需要额外处理
 # 否则额外挂载文件所在目录
 EXCEL_FILE=""
-ARGS_ARRAY=("$@")
 for i in "${!ARGS_ARRAY[@]}"; do
     if [[ "${ARGS_ARRAY[$i]}" == "--excel" || "${ARGS_ARRAY[$i]}" == "-e" ]]; then
         next=$((i + 1))
@@ -199,19 +257,25 @@ CONTAINER_NAME="ones-ai-${CURRENT_USER}-$$"
 # 构建最终参数（保留空格等特殊字符）
 mapfile -t FINAL_ARGS < <(build_args "$@")
 
-# 将参数安全地序列化为shell-escaped字符串
-ESCAPED_ARGS=""
+# 将参数写入临时文件，避免 printf '%q' 破坏中文字符
+# 每行一个参数，容器内读取后逐行恢复
+ARGS_FILE=$(mktemp /tmp/ones-ai-args.XXXXXX)
+CLEANUP_FILES+=("$ARGS_FILE")
 for arg in "${FINAL_ARGS[@]}"; do
-    # 用printf %q安全转义每个参数
-    ESCAPED_ARGS="$ESCAPED_ARGS $(printf '%q' "$arg")"
+    echo "$arg" >> "$ARGS_FILE"
 done
 
 step "启动 ones-AI (容器: $CONTAINER_NAME)..."
 
-# 交互式检测：如果是交互模式或需要tty输入，用-it；否则仅-i
+# 交互式检测：
+#  - 如果带 --json-output 参数（前端调用），强制非交互
+#  - 如果 stdin 不是终端（SSH/管道），用 -i
+#  - 否则用 -it
 DOCKER_IT="-it"
+for _a in "$@"; do
+    [[ "$_a" == "--json-output" ]] && { DOCKER_IT="-i"; break; }
+done
 if [ ! -t 0 ]; then
-    # stdin不是终端（可能是管道），只用 -i
     DOCKER_IT="-i"
 fi
 
@@ -219,7 +283,7 @@ docker run $DOCKER_IT --rm \
     --name "$CONTAINER_NAME" \
     --user "$(id -u):$(id -g)" \
     --network host \
-    --entrypoint /bin/sh \
+    --entrypoint /bin/bash \
     -e "HOME=${USER_HOME}" \
     -e "USER=${CURRENT_USER}" \
     -e "HOSTNAME=$(hostname)" \
@@ -227,17 +291,18 @@ docker run $DOCKER_IT --rm \
     -e "ANTHROPIC_AUTH_TOKEN=${API_KEY}" \
     -e "ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic" \
     -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-4.7" \
-    -e "ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5.1" \
-    -e "ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.1" \
+    -e "ANTHROPIC_DEFAULT_SONNET_MODEL=glm-4.7" \
+    -e "ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5" \
     -e "API_TIMEOUT_MS=3000000" \
     -e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1" \
     -e "GIT_DISCOVERY_ACROSS_FILESYSTEM=1" \
     "${MOUNT_ARGS[@]}" \
     -v "${CONTAINER_PASSWD}:/etc/passwd:ro" \
+    -v "${ARGS_FILE}:/tmp/ones-ai-args:ro" \
     -w "${WORK_DIR}" \
     "$DOCKER_IMAGE" \
-    -c "
-git config --global --add safe.directory '*' 2>/dev/null
-${RUNNER_CMD} ${ESCAPED_ARGS}
-"
-
+    -c '
+git config --global --add safe.directory "*" 2>/dev/null
+mapfile -t _ARGS < /tmp/ones-ai-args
+'"${RUNNER_CMD}"' "${_ARGS[@]}"
+'
