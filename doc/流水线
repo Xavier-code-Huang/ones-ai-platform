@@ -1,0 +1,2041 @@
+/**
+ * Autotest-TestStep-Instance Pipeline
+ * 用途：执行单个自动化测试任务实例
+ * 部署位置：test-agent 节点、
+ * 参数：
+ *   - TASK_FILE_NAME: 任务文件名
+ *   - TASK_JSON: 任务JSON内容
+ */
+
+pipeline {
+    agent {
+        label 'test-agent'
+    }
+
+    parameters {
+        string(name: 'TASK_FILE_NAME', defaultValue: '', description: '任务文件名')
+        text(name: 'TASK_JSON', defaultValue: '', description: '任务JSON内容')
+        string(name: 'DEVICE_LOCK_MAX_RETRIES', defaultValue: '3', description: '设备锁定最大重试次数')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 300, unit: 'MINUTES')  // 单个测试超时时间
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+    }
+
+    environment {
+        TEST_NODE_IP = '127.0.0.1'
+        TEST_NODE_USER = 'jenkins'
+    }
+
+    stages {
+        stage('解析任务参数') {
+            steps {
+                script {
+                    echo "=== 解析任务参数 ==="
+                    echo "任务文件: ${params.TASK_FILE_NAME}"
+
+                    if (!params.TASK_JSON) {
+                        error "TASK_JSON 参数为空"
+                    }
+
+                    try {
+                        // 解析任务JSON
+                        def taskInfo = parseJsonToMap(params.TASK_JSON)
+                        
+                        env.TASK_INFO_JSON = new groovy.json.JsonOutput().toJson(taskInfo)
+
+                        // 调试：打印TASK_JSON和解析结果
+                        echo "=== 调试信息 ==="
+                        echo "原始TASK_JSON长度: ${params.TASK_JSON.length()}"
+                        echo "解析后的taskInfo类型: ${taskInfo.getClass()}"
+                        echo "project_name: ${taskInfo.project_name}"
+                        echo "build_number: ${taskInfo.build_number}"
+                        echo "firmware_path: ${taskInfo.firmware_path}"
+                        echo "test_board_type: ${taskInfo.test_board_type}"
+                        echo "customer_version: ${taskInfo.customer_version}"
+                        echo "==============="
+
+                        // 验证必要参数
+                        def missingParams = []
+                        if (!taskInfo.project_name) missingParams << "project_name"
+                        if (!taskInfo.firmware_path) missingParams << "firmware_path"
+                        if (!taskInfo.test_board_type) missingParams << "test_board_type"
+                        
+                        if (missingParams) {
+                            error "任务信息不完整：缺少必要参数 ${missingParams.join(', ')}"
+                        }
+
+                        // ✅ 这里新增：从 firmware_path 提取固件版本号，并写回 taskInfo
+                        def fwVersion = extractFirmwareVersion(taskInfo.firmware_path ?: '')
+                        taskInfo.firmware_version = fwVersion
+
+                        // ✅ 重新序列化：确保后续阶段 parse env.TASK_INFO_JSON 时能拿到 firmware_version
+                        env.TASK_INFO_JSON = new groovy.json.JsonOutput().toJson(taskInfo)
+
+                        echo "firmware_version: ${fwVersion}"
+
+                        // ⚠️ 重要：不要覆盖 Jenkins 内置的 BUILD_NUMBER！
+                        // 保存任务信息到环境变量（使用 TASK_BUILD_NUMBER 而不是 BUILD_NUMBER）
+                        env.PROJECT_NAME = taskInfo.project_name ?: ""
+                        env.TASK_BUILD_NUMBER = taskInfo.build_number ?: ""  // ✅ 任务的构建号
+                        env.FIRMWARE_PATH = taskInfo.firmware_path ?: ""
+                        env.TEST_BOARD_TYPE = taskInfo.test_board_type ?: ""
+                        env.AGENT_NAME = taskInfo.agent_name ?: ""
+                        env.UPLOAD_SERVER = taskInfo.upload_server ?: "ChangSha"
+                        env.CUSTOMER_VERSION = taskInfo.customer_version ?: ""
+                        env.RETRY_COUNT = taskInfo.retry_count ?: 0
+                        
+                        echo "=== 构建号说明 ==="
+                        echo "Instance 构建号 (env.BUILD_NUMBER): ${env.BUILD_NUMBER}"
+                        echo "任务构建号 (env.TASK_BUILD_NUMBER): ${env.TASK_BUILD_NUMBER}"
+                        echo "================="
+                        
+                    } catch (Exception e) {
+                        echo "JSON解析异常: ${e.getMessage()}"
+                        echo "StackTrace: ${e.getStackTrace().join('\n')}"
+                        error "解析任务JSON失败: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('执行自动化测试') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'rainier-ssh-rsa',
+                    keyFileVariable: 'GIT_SSH_KEY',
+                    usernameVariable: 'GIT_USER'
+                )]) {
+                    script {
+                        try {
+                            echo "开始执行自动化测试..."
+                            echo "TASK_INFO_JSON 类型: ${env.TASK_INFO_JSON.getClass()}"
+                            
+                            def taskInfo = parseJsonToMap(env.TASK_INFO_JSON)
+                            
+                            def testResult = performAutoTest(taskInfo)
+                            env.TEST_RESULT = testResult
+
+                            if (testResult == 'SUCCESS') {
+                                echo "✅ 测试执行成功"
+                                // ✅ 立即标记测试执行成功（用于在 post.unstable 中区分失败原因）
+                                env.TEST_EXECUTION_SUCCESS = 'true'
+                            } else {
+                                echo "❌ 测试执行失败: ${testResult}"
+                                currentBuild.result = 'FAILURE'
+                            }
+                            
+                        } catch (Exception e) {
+                            echo "测试执行阶段异常: ${e.getClass().getName()}: ${e.getMessage()}"
+                            echo "StackTrace: ${e.getStackTrace().join('\n')}"
+                            currentBuild.result = 'FAILURE'
+                            env.TEST_RESULT = 'FAILURE'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Generate Report') {
+            agent { label '101-node1' }
+            tools {
+                allure 'Allure-2.33.0'
+            }
+            when {
+                expression { env.TEST_RESULT == 'SUCCESS' }
+            }
+            steps {
+                script {
+                    def taskInfo = parseJsonToMap(env.TASK_INFO_JSON ?: '{}')
+                    // ✅ 修复：使用与stash时相同的命名规则（替换特殊字符）
+                    def safeProjectName = taskInfo.project_name?.replaceAll('[/_]', '-') ?: 'unknown'
+                    def safeBuildNumber = taskInfo.build_number?.toString()?.replaceAll('[/_]', '-') ?: 'unknown'
+                    def stashName = "allure-results-${safeProjectName}-${safeBuildNumber}"
+                    
+                    echo "正在 unstash 测试结果: ${stashName}"
+                    unstash stashName
+                    
+                    // ✅ 按照Instance构建号创建独立的报告目录结构
+                    // 路径：allure-reports/<instance_build_number>/<project_name>-<task_build_number>
+                    def instanceBuildNumber = env.BUILD_NUMBER  // Instance 自己的构建号
+                    def taskBuildNumber = taskInfo.build_number  // 任务的构建号
+                    def buildNumberDir = "${env.WORKSPACE}/allure-reports/${instanceBuildNumber}"
+                    def reportDir = "${buildNumberDir}/${taskInfo.project_name}-${taskBuildNumber}"
+                    
+                    echo "创建报告目录: ${reportDir}"
+                    echo "  Instance 构建号: ${instanceBuildNumber}"
+                    echo "  任务构建号: ${taskBuildNumber}"
+                    sh "mkdir -p ${reportDir}"
+                    
+                    echo "生成 Allure 报告..."
+                    // ✅ 从Instance构建号目录读取测试结果
+                    allure([
+                        includeProperties: false,
+                        jdk: '',
+                        reportBuildPolicy: "ALWAYS", 
+                        results: [[path: "output_result/${instanceBuildNumber}/reports"]],
+                        report: "${reportDir}",
+                        properties: []
+                    ])
+
+                    // ✅ 打包 Allure 报告
+                    def zipFileName = "allure-report-${taskInfo.project_name}-${taskBuildNumber}.zip"
+                    echo "📦 打包 Allure 报告: ${zipFileName}"
+                    sh """
+                        cd ${buildNumberDir}
+                        zip -r ${env.WORKSPACE}/${zipFileName} ${taskInfo.project_name}-${taskBuildNumber}
+                    """
+                    
+                    def allureZipStashName = "allure-report-zip-${safeProjectName}-${safeBuildNumber}"
+                    stash name: allureZipStashName, includes: zipFileName
+                    env.ALLURE_ZIP_STASH_NAME = allureZipStashName
+                    env.ALLURE_ZIP_FILE_NAME = zipFileName
+
+                    // ✅ 将 Allure 报告压缩包复制到共享目录 (processing)，供 TestStep 流水线处理
+                    def sharedProcessingDir = "/home/jenkins/autotest_scan/processing"
+                    sh """
+                        mkdir -p ${sharedProcessingDir}
+                        cp ${env.WORKSPACE}/${zipFileName} ${sharedProcessingDir}/${zipFileName}
+                        echo "✅ Allure 报告压缩包已复制到共享目录: ${sharedProcessingDir}/${zipFileName}"
+                    """
+
+                    // 拷贝报告给EDLA属性识别使用（以上游任务名-构建号的形式）
+                    def reportCopyForEDLA = sh(
+                        script: "cp -r ${env.WORKSPACE}/output_result/${instanceBuildNumber} ${env.WORKSPACE}/output_result/${env.PROJECT_NAME}-${env.TASK_BUILD_NUMBER}", 
+                        returnStatus: true
+                    )
+                    
+                    // ✅ 检查文件夹复制状态
+                    if (reportCopyForEDLA == 0) {
+                        echo "✅ 成功复制构建文件夹"
+                        echo "   源文件夹: output_result/${instanceBuildNumber}"
+                        echo "   目标文件夹: output_result/${env.PROJECT_NAME}-${env.TASK_BUILD_NUMBER}"
+                        
+                        // 验证目标文件夹是否存在
+                        def copyVerify = sh(
+                            script: "test -d ${env.WORKSPACE}/output_result/${env.PROJECT_NAME}-${env.TASK_BUILD_NUMBER} && echo '目标文件夹验证成功' || echo '目标文件夹验证失败'",
+                            returnStdout: true
+                        ).trim()
+                        echo "   验证结果: ${copyVerify}"
+                    } else {
+                        echo "⚠️ 文件夹复制失败或出现异常，错误码: ${reportCopyForEDLA}"
+                    }
+                    
+                    // ✅ 打印报告内容到日志（读取当前Instance构建的报告）
+                    def reportPreview = sh(
+                        script: "cat ${env.WORKSPACE}/output_result/${instanceBuildNumber}/output_result/allure_report_*.txt 2>/dev/null || echo '暂无测试报告内容'", 
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "=== Allure 测试报告 (Instance #${instanceBuildNumber}, 任务 #${taskBuildNumber}) ==="
+                    echo reportPreview
+                    echo "======================="
+                    
+                    // 保存报告预览到环境变量，供后续使用
+                    env.ALLURE_REPORT_PREVIEW = reportPreview
+                    
+                    // ✅ 可选：清理超过7天的旧报告目录
+                    try {
+                        sh """
+                            find ${env.WORKSPACE}/allure-reports -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \\; 2>/dev/null || true
+                            find /home/disk1/jenkins-workspace/workspace/Autotest-TestStep-Instance/output_result -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \\; 2>/dev/null || true 
+                            find /home/disk1/jenkins-workspace/workspace/Autotest-TestStep-Instance/allure-reports -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \\; 2>/dev/null || true 
+                        """
+                        echo "已清理7天前的旧报告目录"
+                    } catch (Exception e) {
+                        echo "清理旧报告时出错: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                def taskInfo = parseJsonToMap(env.TASK_INFO_JSON ?: '{}')
+                echo "测试实例执行成功（所有测试用例通过）: ${taskInfo.project_name}-${taskInfo.build_number}"
+                
+                // post.success 只在所有stage都成功且Allure没有将状态改为UNSTABLE时执行
+                // 此时 env.TEST_EXECUTION_SUCCESS 应该已经在 "执行自动化测试" stage 中设置
+                currentBuild.description = "✅ 测试执行成功，所有用例通过\n任务: ${params.TASK_FILE_NAME}"
+                env.TEST_FAILURE_REASON = "NONE"
+            }
+        }
+        unstable {
+            script {
+                def taskInfo = parseJsonToMap(env.TASK_INFO_JSON ?: '{}')
+                
+                echo "构建状态为 UNSTABLE，检查失败原因..."
+                echo "TEST_EXECUTION_SUCCESS = ${env.TEST_EXECUTION_SUCCESS}"
+                echo "TEST_FAILURE_REASON = ${env.TEST_FAILURE_REASON}"
+                
+                // UNSTABLE 可能由两种情况导致：
+                // 1. 测试执行成功，但 Allure 报告显示有用例失败（env.TEST_EXECUTION_SUCCESS == 'true'）
+                // 2. 测试执行失败，failure 块中设置为 UNSTABLE（env.TEST_FAILURE_REASON 已设置）
+                
+                if (env.TEST_EXECUTION_SUCCESS == 'true') {
+                    // 情况1：测试执行成功，但有用例失败（Allure导致UNSTABLE）
+                    echo "✅ 测试执行成功，但存在失败的测试用例（Allure报告导致UNSTABLE）"
+                    currentBuild.description = "⚠️ 测试执行成功，部分用例失败\n任务: ${params.TASK_FILE_NAME}"
+                    // 保持 UNSTABLE 状态，但标记为测试成功类型
+                    env.TEST_FAILURE_REASON = "TEST_CASES_FAILED"
+                } else if (env.TEST_FAILURE_REASON == 'DEVICE_BUSY') {
+                    // 情况2：设备占用（已在 failure 块中设置）
+                    echo "⚠️ 测试因设备占用失败，已标记为UNSTABLE"
+                    currentBuild.description = "⚠️ 设备占用，等待重试\n任务: ${params.TASK_FILE_NAME}"
+                } else {
+                    // 情况3：未知原因导致UNSTABLE（不应该出现，记录警告）
+                    echo "⚠️ 未知原因导致UNSTABLE状态"
+                    echo "   TEST_EXECUTION_SUCCESS = ${env.TEST_EXECUTION_SUCCESS}"
+                    echo "   TEST_FAILURE_REASON = ${env.TEST_FAILURE_REASON}"
+                    
+                    // 默认判定为测试用例失败（因为如果是设备占用应该在failure块处理）
+                    if (!env.TEST_FAILURE_REASON) {
+                        env.TEST_FAILURE_REASON = "UNKNOWN"
+                    }
+                    currentBuild.description = "⚠️ UNSTABLE (${env.TEST_FAILURE_REASON})\n任务: ${params.TASK_FILE_NAME}"
+                }
+            }
+        }
+        failure {
+            script {
+                echo "测试执行失败"
+                
+                // 读取失败原因
+                def failureReason = "UNKNOWN"
+                def failureReasonFile = "${env.WORKSPACE}/test_failure_reason.txt"
+                
+                try {
+                    if (fileExists(failureReasonFile)) {
+                        failureReason = readFile(failureReasonFile).trim()
+                        echo "检测到失败原因: ${failureReason}"
+                    } else {
+                        echo "未找到失败原因文件，使用默认值: UNKNOWN"
+                    }
+                } catch (Exception e) {
+                    echo "读取失败原因文件时出错: ${e.message}"
+                }
+                
+                // 保存失败原因到环境变量
+                env.TEST_FAILURE_REASON = failureReason
+                
+                // 根据失败原因设置不同的构建结果和描述
+                if (failureReason == "DEVICE_BUSY") {
+                    // 设备占用，标记为UNSTABLE（表示需要重试但不是严重错误）
+                    currentBuild.result = 'UNSTABLE'
+                    currentBuild.description = "⚠️ 设备占用，等待重试\n任务: ${params.TASK_FILE_NAME}"
+                    echo "设备占用失败，构建标记为UNSTABLE，任务将移回scan目录"
+                } else {
+                    // 其他失败，标记为FAILURE
+                    currentBuild.result = 'FAILURE'
+                    def reasonText = getFailureReasonText(failureReason)
+                    currentBuild.description = "❌ 测试失败: ${reasonText}\n任务: ${params.TASK_FILE_NAME}"
+                    echo "测试失败（原因: ${reasonText}），构建标记为FAILURE，任务将移到failed目录"
+                }
+            }
+        }
+        always {
+            script {
+                echo "实例执行完成 - 结果: ${currentBuild.currentResult}"
+                echo "任务文件: ${params.TASK_FILE_NAME}"
+                echo "Post Actions WORKSPACE: ${env.WORKSPACE}"
+
+                // 确保设备被解锁
+                try {
+                    def devUrl = sh(
+                        script: "cat /tmp/device_url.txt 2>/dev/null || echo ''",
+                        returnStdout: true
+                    ).trim()
+
+                    if (devUrl) {
+                        echo "尝试解锁设备: ${devUrl}"
+                        sh(
+                            script: """
+                            curl -s -b ~/cookies.txt -X POST "${devUrl}unlock" && echo "设备解锁成功" || echo "WARN: 设备解锁可能失败"
+                            """,
+                            returnStatus: true
+                        )
+                    } else {
+                        echo "未找到设备URL，跳过解锁"
+                    }
+                } catch (Exception e) {
+                    echo "解锁设备时发生异常: ${e.getMessage()}"
+                }
+                
+                // ✅ 第一步：在 test-agent 节点 stash 测试总结文件
+                script {
+                    try {
+                        def taskInfo = parseJsonToMap(env.TASK_INFO_JSON ?: '{}')
+                        def summaryFile = "test_summary_${params.TASK_FILE_NAME.replace('.json', '')}.txt"
+                        def summaryPath = "${env.WORKSPACE}/${summaryFile}"
+                        
+                        // ✅ 在stash之前，追加测试执行状态到test_summary文件
+                        if (fileExists(summaryPath)) {
+                            def testStatus = ""
+                            def buildResult = currentBuild.currentResult
+                            
+                            if (buildResult == 'SUCCESS') {
+                                testStatus = "✅ 测试执行成功"
+                            } else if (buildResult == 'UNSTABLE') {
+                                if (env.TEST_EXECUTION_SUCCESS == 'true') {
+                                    testStatus = "⚠️ 部分用例失败"
+                                } else {
+                                    testStatus = "⚠️ 测试执行异常"
+                                }
+                            } else if (buildResult == 'FAILURE') {
+                                testStatus = "❌ 测试失败"
+                            } else {
+                                testStatus = "未知状态: ${buildResult}"
+                            }
+                            
+                            sh """
+                                echo "${testStatus}" >> ${summaryPath}
+                            """
+                            echo "✅ 已添加测试执行状态: ${testStatus}"
+                        }
+                        
+                        // ✅ 修复：将stash名称中的特殊字符替换为合法字符（斜杠、下划线等替换为连字符）
+                        def safeProjectName = taskInfo.project_name?.replaceAll('[/_]', '-') ?: 'unknown'
+                        def safeBuildNumber = taskInfo.build_number?.toString()?.replaceAll('[/_]', '-') ?: 'unknown'
+                        def stashName = "test-summary-${safeProjectName}-${safeBuildNumber}"
+                        
+                        echo "📦 准备stash测试总结文件（test-agent节点）..."
+                        echo "   项目名: ${taskInfo.project_name}"
+                        echo "   构建号: ${taskInfo.build_number}"
+                        echo "   文件名: ${summaryFile}"
+                        echo "   Stash名: ${stashName}"
+                        
+                        if (fileExists(summaryPath)) {
+                            echo "✅ Stash 测试总结文件: ${summaryFile} (stash: ${stashName})"
+                            stash name: stashName, includes: summaryFile
+                            
+                            // 同时也存档，以便查看
+                            archiveArtifacts artifacts: summaryFile, allowEmptyArchive: true, fingerprint: true
+                            echo "✅ 测试总结文件已 stash，可供跨节点获取"
+                            
+                            // ⚠️ 保存信息到环境变量供后续节点使用
+                            env.SUMMARY_FILE_NAME = summaryFile
+                            env.STASH_NAME = stashName
+                        } else {
+                            echo "⚠️ 警告: 测试总结文件不存在: ${summaryPath}"
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Stash 测试总结文件时出错: ${e.getMessage()}"
+                    }
+                }
+                
+                // ✅ 第二步：切换到 101-node1 节点，unstash 并复制到共享目录
+                script {
+                    if (env.STASH_NAME && env.SUMMARY_FILE_NAME) {
+                        try {
+                            echo "🔄 切换到 101-node1 节点处理文件传递..."
+                            node('101-node1') {
+                                ws {
+                                    // 在 101-node1 节点 unstash 文件
+                                    echo "📥 在 101-node1 节点 unstash 测试总结文件: ${env.STASH_NAME}"
+                                    unstash name: env.STASH_NAME
+
+                                    // 复制到共享扫描目录
+                                    def sharedTempDir = "/home/jenkins/autotest_scan/processing"
+                                    sh """
+                                        mkdir -p ${sharedTempDir}
+                                        cp ${env.SUMMARY_FILE_NAME} ${sharedTempDir}/${env.SUMMARY_FILE_NAME}
+                                        echo "✅ 测试总结文件已在 101-node1 节点复制到共享目录: ${sharedTempDir}/${env.SUMMARY_FILE_NAME}"
+                                        ls -lh ${sharedTempDir}/${env.SUMMARY_FILE_NAME}
+                                    """
+
+                                    // ✅ 第三步：额外备份到持久存储服务器 (10.10.10.181)
+                                    // 注意：此步骤已移动到 Auto-test-teststep 流水线中统一处理
+                                    // Instance 只负责将 zip 包复制到 processing 目录（已在 Generate Report 阶段完成）
+                                    echo "ℹ️ Allure 报告备份将由 Auto-test-teststep 流水线处理"
+                                }
+                            }
+                            echo "✅ 文件已成功传递到 101-node1 节点的共享目录"
+                        } catch (Exception e) {
+                            echo "⚠️ 在 101-node1 节点处理文件时出错: ${e.getMessage()}"
+                            echo "   StackTrace: ${e.getStackTrace().join('\n')}"
+                        }
+                    } else {
+                        echo "⚠️ 未找到stash信息，跳过文件传递"
+                    }
+                }
+                
+                // ✅ 输出最终的失败原因供 TestStep 读取（支持日志解析）
+                try {
+                    // 优先使用环境变量中的失败原因（由 post.success/unstable/failure 设置）
+                    def finalReason = env.TEST_FAILURE_REASON
+                    
+                    // 如果环境变量没有设置，尝试从文件读取
+                    if (!finalReason || finalReason == 'null') {
+                        def failureReasonFile = "${env.WORKSPACE}/test_failure_reason.txt"
+                        if (fileExists(failureReasonFile)) {
+                            finalReason = readFile(failureReasonFile).trim()
+                        }
+                    }
+                    
+                    // 输出失败原因（使用 TestStep 能识别的格式）
+                    if (finalReason && finalReason != 'null') {
+                        echo "=== 测试失败原因: ${finalReason} ==="
+                    } else {
+                        // 如果没有失败原因，说明可能是测试完全成功
+                        echo "=== 测试失败原因: NONE ==="
+                    }
+                } catch (Exception e) {
+                    echo "输出失败原因时出错: ${e.message}"
+                    echo "=== 测试失败原因: UNKNOWN ==="
+                }
+                
+                // ✅ 第三步：返回 test-agent 节点发送即时专属通知
+                script {
+                    try {
+                        def taskInfo = parseJsonToMap(env.TASK_INFO_JSON ?: '{}')
+                        // 默认邮箱
+                        def defaultEmail = 'yixiang.huang@lango-tech.cn'
+                        if (!taskInfo.recipient_list || !taskInfo.recipient_list.trim()) {
+                            taskInfo.recipient_list = defaultEmail
+                            echo "ℹ️ 未设置专属通知邮箱，已自动添加默认邮箱: ${defaultEmail}"
+                        } else if (!taskInfo.recipient_list.contains(defaultEmail)) {
+                            // 如果已有收件人但不包含默认邮箱，则追加
+                            taskInfo.recipient_list += ",${defaultEmail}"
+                            echo "📧 已自动追加默认邮箱到专属通知列表: ${taskInfo.recipient_list}"
+                        } else {
+                            echo "📧 检测到专属通知邮箱列表，准备发送即时通知（test-agent节点）..."
+                        }
+                        sendImmediateNotification(taskInfo)
+                    } catch (Exception e) {
+                        echo "⚠️ 发送即时通知时出错: ${e.getMessage()}"
+                        echo "   StackTrace: ${e.getStackTrace().join('\n')}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== 测试执行函数 ====================
+
+def performAutoTest(taskInfo) {
+    echo "开始执行自动化测试: ${taskInfo.project_name}-${taskInfo.build_number}"
+    
+    // 添加类型检查和转换
+    def localTaskInfo = parseJsonToMap(env.TASK_INFO_JSON)
+    
+    // 确保所有必要字段都存在
+    if (!localTaskInfo.project_name || !localTaskInfo.firmware_path || !localTaskInfo.test_board_type) {
+        error "任务信息不完整：project_name、firmware_path 或 test_board_type 缺失"
+    }
+    
+    // 设置测试所需的环境变量
+    env.SOURCE_PROJECT = localTaskInfo.project_name ?: ""
+    env.PROJECT_REAL_NAME = localTaskInfo.project_real_name ?: (localTaskInfo.project_name ? localTaskInfo.project_name.split('/')[0] : "")
+    env.FIRMWARE_PATH = localTaskInfo.firmware_path ?: ""
+    env.PARAM_B_BOARD_TYPE = localTaskInfo.board_type ?: ""
+    env.PARAM_T_BOARD_TYPE = localTaskInfo.test_board_type ?: ""
+    env.PARAM_AGENT_NAME = localTaskInfo.agent_name ?: ""
+    env.UPSTREAM_NODE_LOCATION = localTaskInfo.upload_server ?: "ChangSha"
+    env.CUSTOMER_VERSION = localTaskInfo.customer_version ?: ""
+    env.PARAM_START_AUTOTEST = true
+
+    try {
+        def testResult = runAutoTestScript(localTaskInfo)
+        return testResult
+    } catch (Exception e) {
+        echo "测试执行异常: ${e.getClass().getName()}: ${e.getMessage()}"
+        echo "StackTrace: ${e.getStackTrace().join('\n')}"
+        return 'FAILURE'
+    }
+}
+
+def runAutoTestScript(taskInfo) {
+    def testResult = 'UNKNOWN'
+    def stageDurations = [:]
+
+    try {
+        echo "=== 开始单个测试任务 ==="
+        echo "项目: ${taskInfo.project_name}"
+        echo "构建: ${taskInfo.build_number}"
+        echo "版本: ${taskInfo.customer_version}"
+
+        // ✅ 修复：将 Groovy 变量转换为字符串，直接插值到 shell 脚本中
+        def uploadServer = taskInfo.upload_server ?: 'ChangSha'
+        def projectName = taskInfo.project_name ?: ''
+        def buildNumber = taskInfo.build_number ?: ''
+        def firmwarePath = taskInfo.firmware_path ?: 'null'
+        def boardType = taskInfo.board_type ?: ''
+        def testBoardType = taskInfo.test_board_type ?: ''
+        def agentName = taskInfo.agent_name ?: ''
+        def customerVersion = taskInfo.customer_version ?: ''
+        def maxRetries = params.DEVICE_LOCK_MAX_RETRIES ?: '3'
+        def taskFileName = params.TASK_FILE_NAME ?: ''
+        def summaryFileName = taskFileName.replace('.json', '')
+
+        // 执行聚合脚本
+        def scriptStatus = sh(
+            script: """
+            #!/bin/bash
+            set -e
+
+            # 初始化时长变量
+            SETUP_DURATION=0
+            LOCK_DURATION=0
+            UPDATE_DURATION=0
+            EXECUTE_DURATION=0
+            COLLECT_DURATION=0
+            UNLOCK_DURATION=0
+
+            # 定义获取毫秒时间戳的函数
+            get_timestamp_ms() {
+                python3 -c "import time; print(int(time.time() * 1000))"
+            }
+
+            # 步骤1: 设置测试环境
+            echo >&2 "步骤1: 设置测试环境"
+            START_TIME=\$(get_timestamp_ms)
+            
+            # 1. 基础配置
+            BASE_URL="https://rainier.lango-tech.com/v1"
+            if [ "${uploadServer}" = "ChangSha" ]; then
+                SERVER_PREFIX="http://csfile.lango-tech.com:10012/firmware"
+            else
+                SERVER_PREFIX="http://gzfile.lango-tech.com:10012/firmware"
+            fi
+            REASON="InstanceTest-${projectName}-${buildNumber}"
+
+            # 2. 构建固件URL
+            FIRMWARE_URL="\${SERVER_PREFIX}/${firmwarePath}"
+            echo >&2 "构建固件URL: \${FIRMWARE_URL}"
+            if [ "\${FIRMWARE_URL##*/}" = "null" ] || [ -z "${firmwarePath}" ]; then
+                echo >&2 "ERROR: 固件URL为null，退出测试"
+                exit 1
+            fi
+
+            # 3. 配置SSH环境并获取测试脚本
+            echo >&2 "配置SSH环境..."
+            mkdir -p ~/.ssh
+            install -m 0600 "\${GIT_SSH_KEY}" ~/.ssh/id_rsa
+            ssh-keyscan -p 29418 192.168.1.92 > ~/.ssh/known_hosts 2>/dev/null
+
+            # 设置GIT_SSH_COMMAND以确保使用正确的私钥和known_hosts
+            export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_rsa -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=no"
+
+            echo >&2 "获取测试脚本..."
+            rm -rf LangoAutoTestScripts
+            git clone -b developer_common ssh://git@192.168.1.92:29418/LangoAutoTestScripts.git || {
+                echo >&2 "ERROR: 无法获取测试脚本"
+                echo "GIT_CLONE_FAILED" > ${env.WORKSPACE}/test_failure_reason.txt
+                exit 1
+            }
+
+            cd LangoAutoTestScripts
+            python3 scripts/package.py --customer_name ${boardType} || {
+                echo >&2 "ERROR: 打包测试脚本失败"
+                echo "TEST_PACKAGE_BUILD_FAILED" > ${env.WORKSPACE}/test_failure_reason.txt
+                exit 1
+            }
+            echo >&2 "测试环境设置完成"
+            
+            END_TIME=\$(get_timestamp_ms)
+            SETUP_DURATION=\$((END_TIME - START_TIME))
+
+            # 步骤2: 查找和锁定设备
+            echo >&2 "步骤2: 查找和锁定设备"
+            START_TIME=\$(get_timestamp_ms)
+            
+            BASE_URL="https://rainier.lango-tech.com/v1"
+            REASON="\$(basename \$0)@\$(cat /etc/hostname)"
+            MAX_RETRIES=${maxRetries}
+            LOCK_DURATION_TIME=18000
+            RETRY_DELAY=5
+
+            echo >&2 "设备查找参数:"
+            echo >&2 "  项目: ${projectName}"
+            echo >&2 "  构建: ${buildNumber}"
+            echo >&2 "  板型: ${testBoardType}"
+            echo >&2 "  设备名: ${agentName ?: '未指定'}"
+
+            current_retry=0
+            locked=0
+            DEV_URL=""
+
+            while [ \$current_retry -lt \$MAX_RETRIES ]; do
+                echo >&2 "=== 设备锁定尝试 \$((current_retry+1))/\$MAX_RETRIES ==="
+
+                if [ -z "${agentName}" ] || [ "${agentName}" = "null" ]; then
+                    echo >&2 "使用BOARD参数查找设备: ${testBoardType}"
+                    DEV_URL=\$(curl -s -b ~/cookies.txt "\${BASE_URL}/list?BOARD=${testBoardType}&LOCK_REASON=\$REASON|" | jq -r '.[] | .URL' | head -n1)
+                else
+                    echo >&2 "使用NAME参数查找设备: ${agentName}"
+                    DEV_URL=\$(curl -s -b ~/cookies.txt "\${BASE_URL}/list?NAME=${agentName}&LOCK_REASON=\$REASON|" | jq -r '.[] | .URL' | head -n1)
+                fi
+
+                if [ -z "\$DEV_URL" ]; then
+                    echo >&2 "WARN: 没有找到可用设备，尝试 \$((current_retry+1))/\$MAX_RETRIES"
+                    current_retry=\$((current_retry + 1))
+                    if [ \$current_retry -lt \$MAX_RETRIES ]; then
+                        echo >&2 "等待 \$RETRY_DELAY 秒后重试..."
+                        sleep \$RETRY_DELAY
+                    fi
+                    continue
+                fi
+
+                echo >&2 "尝试锁定设备: \$DEV_URL"
+                LOCK_INFO=\$(curl -s -b ~/cookies.txt -X POST "\${DEV_URL}lock" \\
+                    -H "Content-Type: application/json" \\
+                    -d '{"reason": "'\$REASON'", "duration": '\$LOCK_DURATION_TIME'}')
+
+                if [ -n "\$(echo "\$LOCK_INFO" | grep "Locked")" ]; then
+                    locked=1
+                    echo >&2 "SUCCESS: 成功锁定设备 \$DEV_URL"
+                    echo "\$DEV_URL" > /tmp/device_url.txt
+                    break
+                else
+                    echo >&2 "WARN: 锁定设备 \$DEV_URL 失败: \$LOCK_INFO"
+                    current_retry=\$((current_retry + 1))
+                    if [ \$current_retry -lt \$MAX_RETRIES ]; then
+                        echo >&2 "等待 \$RETRY_DELAY 秒后重试..."
+                        sleep \$RETRY_DELAY
+                    fi
+                    DEV_URL=""
+                fi
+            done
+
+            if [ \$locked -ne 1 ]; then
+                echo >&2 "ERROR: 多次尝试后仍无法锁定设备"
+                echo "DEVICE_BUSY" > ${env.WORKSPACE}/test_failure_reason.txt
+                echo "RETRY"
+                exit 2
+            fi
+
+            echo >&2 "设备锁定成功: \$DEV_URL"
+            DEV_URL=\$(cat /tmp/device_url.txt)
+            
+            END_TIME=\$(get_timestamp_ms)
+            LOCK_DURATION=\$((END_TIME - START_TIME))
+
+            # 步骤3: 更新固件
+            echo >&2 "步骤3: 更新固件"
+            START_TIME=\$(get_timestamp_ms)
+            
+            # 构建固件URL（直接使用之前已经构建的FIRMWARE_URL）
+            echo >&2 "使用固件URL: \${FIRMWARE_URL}"
+
+            echo >&2 "目标设备: \$DEV_URL"
+
+            echo >&2 "开始固件升级..."
+            curl -s -b ~/cookies.txt "\${DEV_URL}update?url=\${FIRMWARE_URL}" || {
+                echo >&2 "ERROR: 固件升级失败"
+                echo "FIRMWARE_UPDATE_FAILED" > ${env.WORKSPACE}/test_failure_reason.txt
+                exit 1
+            }
+
+            echo >&2 "固件更新完成"
+            
+            END_TIME=\$(get_timestamp_ms)
+            UPDATE_DURATION=\$((END_TIME - START_TIME))
+
+            # 步骤4: 执行测试
+            echo >&2 "步骤4: 执行测试"
+            START_TIME=\$(get_timestamp_ms)
+            
+            echo >&2 "检查测试包是否存在..."
+            if [ ! -f "./test_package.zip" ]; then
+                echo >&2 "ERROR: 测试包不存在"
+                echo "TEST_PACKAGE_MISSING" > ${env.WORKSPACE}/test_failure_reason.txt
+                exit 1
+            fi
+
+            # echo >&2 "等待3分钟后开始执行测试..."
+            # sleep 180
+
+            echo >&2 "开始执行测试..."
+            echo >&2 "目标设备: \$DEV_URL"
+
+            curl -s -X POST -b ~/cookies.txt "\${DEV_URL}run" \\
+                -H "Content-Type: application/zip" \\
+                --data-binary @test_package.zip || {
+                echo >&2 "ERROR: 测试执行失败"
+                exit 1
+            }
+
+            echo >&2 "测试已启动，开始监控测试日志..."
+
+            # 步骤4.5: 监控测试执行日志
+            echo >&2 "步骤4.5: 监控测试执行日志"
+            MONITOR_START_TIME=\$(date +%s)
+            MAX_MONITOR_TIME=3600  # 最大监控时间1小时
+            CHECK_INTERVAL=30       # 每30秒检查一次
+            LAST_LOG_SIZE=0
+            NO_LOG_COUNT=0          # 连续获取不到日志的次数
+            ERROR_RETRY_COUNT=0     # 检测到错误后的重试次数
+            MAX_ERROR_RETRIES=2     # 检测到错误后最大重试次数
+
+            while true; do
+                CURRENT_TIME=\$(date +%s)
+                ELAPSED_TIME=\$((CURRENT_TIME - MONITOR_START_TIME))
+                
+                if [ \$ELAPSED_TIME -gt \$MAX_MONITOR_TIME ]; then
+                    echo >&2 "WARN: 测试监控超时 (超过\${MAX_MONITOR_TIME}秒)，继续收集结果"
+                    break
+                fi
+
+                # 获取当前日志
+                TEMP_LOG="/tmp/test_log_\${ELAPSED_TIME}.tmp"
+                curl -s -b ~/cookies.txt -o "\$TEMP_LOG" "\${DEV_URL}run?type=log"
+                
+                if [ -f "\$TEMP_LOG" ] && [ -s "\$TEMP_LOG" ]; then
+                    NO_LOG_COUNT=0
+                    CURRENT_SIZE=\$(stat -c%s "\$TEMP_LOG" 2>/dev/null || echo 0)
+                    
+                    if [ "\$CURRENT_SIZE" -gt "\$LAST_LOG_SIZE" ]; then
+                        echo >&2 "=== 测试日志更新 (\${ELAPSED_TIME}秒) ==="
+                        # 显示新增的日志内容
+                        if [ "\$LAST_LOG_SIZE" -gt 0 ]; then
+                            tail -c +\$((LAST_LOG_SIZE + 1)) "\$TEMP_LOG" | head -50
+                        else
+                            head -50 "\$TEMP_LOG"
+                        fi
+                        echo >&2 "=== 日志更新结束 ==="
+                        LAST_LOG_SIZE=\$CURRENT_SIZE
+                    fi
+                    
+                    # 检查测试是否完成 (通过检查日志中是否包含完成标记)
+                    if grep -q "测试完成\\|Test completed\\|All tests finished\\|FINISHED" "\$TEMP_LOG" 2>/dev/null; then
+                        echo >&2 "检测到测试完成标记，停止监控"
+                        break
+                    fi
+                    
+                    # 检查是否有错误或失败标记
+                    if grep -q "测试失败\\|Test failed\\|ERROR\\|FAILED" "\$TEMP_LOG" 2>/dev/null; then
+                        ERROR_RETRY_COUNT=\$((ERROR_RETRY_COUNT + 1))
+                        echo >&2 "WARN: 检测到测试错误 (尝试 \${ERROR_RETRY_COUNT}/\${MAX_ERROR_RETRIES})..."
+                        
+                        if [ \$ERROR_RETRY_COUNT -ge \$MAX_ERROR_RETRIES ]; then
+                            echo >&2 "ERROR: 连续 \${MAX_ERROR_RETRIES} 次检测到测试错误，停止监控"
+                            break
+                        fi
+                    else
+                        # 如果没有检测到错误，重置错误计数器
+                        ERROR_RETRY_COUNT=0
+                    fi
+                else
+                    NO_LOG_COUNT=\$((NO_LOG_COUNT + 1))
+                    echo >&2 "WARN: 无法获取测试日志或日志为空 (尝试 \${NO_LOG_COUNT}/3)..."
+                    
+                    if [ \$NO_LOG_COUNT -ge 3 ]; then
+                        echo >&2 "ERROR: 连续 3 次无法获取有效日志，停止监控"
+                        break
+                    fi
+                fi
+                
+                rm -f "\$TEMP_LOG"
+                
+                echo >&2 "等待\${CHECK_INTERVAL}秒后再次检查日志..."
+                sleep \$CHECK_INTERVAL
+            done
+
+            echo >&2 "测试监控完成"
+            
+            END_TIME=\$(get_timestamp_ms)
+            EXECUTE_DURATION=\$((END_TIME - START_TIME))
+
+            # 步骤5: 收集测试结果
+            echo >&2 "步骤5: 收集测试结果"
+            START_TIME=\$(get_timestamp_ms)
+            
+            echo >&2 "获取测试日志..."
+            rm -rf test_result.log test_result.zip
+            curl -s -b ~/cookies.txt -o test_result.log "\${DEV_URL}run?type=log" || {
+                echo >&2 "ERROR: 获取测试日志失败"
+                echo "TEST_LOG_FETCH_FAILED" > ${env.WORKSPACE}/test_failure_reason.txt
+                exit 1
+            }
+
+            echo >&2 "获取测试结果压缩包..."
+            curl -s -b ~/cookies.txt -o test_result.zip "\${DEV_URL}run?type=zip" || {
+                echo >&2 "ERROR: 获取测试结果压缩包失败"
+                echo "TEST_RESULT_FETCH_FAILED" > ${env.WORKSPACE}/test_failure_reason.txt
+                exit 1
+            }
+
+            echo >&2 "处理测试结果文件..."
+            mv test_result.log \${WORKSPACE}/test_result.log
+            mv test_result.zip \${WORKSPACE}/test_result.zip
+
+            # ✅ 清理旧的输出目录，为每个Instance构建创建独立的结果目录
+            rm -rf \${WORKSPACE}/output_result/
+            rm -rf \${WORKSPACE}/allure-report/
+            rm -rf \${WORKSPACE}/output_report/
+            
+            # 创建以Instance构建号命名的独立目录
+            # ⚠️ 重要：使用 Jenkins 的 BUILD_NUMBER（Instance自己的构建号）
+            INSTANCE_BUILD_NUMBER="${env.BUILD_NUMBER}"
+            BUILD_RESULT_DIR="\${WORKSPACE}/output_result/\${INSTANCE_BUILD_NUMBER}"
+            mkdir -p "\${BUILD_RESULT_DIR}"
+            mkdir -p \${WORKSPACE}/allure-report/
+            chmod -R 755 \${WORKSPACE}/output_result
+
+            echo >&2 "解压测试结果到Instance构建号目录: \${BUILD_RESULT_DIR} (Instance #\${INSTANCE_BUILD_NUMBER})"
+            unzip -o \${WORKSPACE}/test_result.zip -d "\${BUILD_RESULT_DIR}" || {
+                echo >&2 "WARN: 解压测试结果文件失败"
+            }
+
+            echo >&2 "保存测试总结报告..."
+            
+            # 调试信息
+            echo >&2 "WORKSPACE: \${WORKSPACE}"
+            echo >&2 "taskFileName: ${taskFileName}"
+            echo >&2 "文件名: test_summary_${summaryFileName}.txt"
+            
+            # 将毫秒转换为秒（使用浮点除法）
+            SETUP_SEC=\$(awk "BEGIN {printf \\"%.3f\\", \$SETUP_DURATION/1000}")
+            LOCK_SEC=\$(awk "BEGIN {printf \\"%.3f\\", \$LOCK_DURATION/1000}")
+            UPDATE_SEC=\$(awk "BEGIN {printf \\"%.3f\\", \$UPDATE_DURATION/1000}")
+            EXECUTE_SEC=\$(awk "BEGIN {printf \\"%.3f\\", \$EXECUTE_DURATION/1000}")
+            COLLECT_SEC=\$(awk "BEGIN {printf \\"%.3f\\", \$COLLECT_DURATION/1000}")
+            UNLOCK_SEC=\$(awk "BEGIN {printf \\"%.3f\\", \$UNLOCK_DURATION/1000}")
+            
+            # 计算总时长（秒）
+            TOTAL_SEC=\$(awk "BEGIN {printf \\"%.3f\\", (\$SETUP_DURATION + \$LOCK_DURATION + \$UPDATE_DURATION + \$EXECUTE_DURATION + \$COLLECT_DURATION + \$UNLOCK_DURATION) / 1000}")
+            
+            # 生成报告头
+            {
+                echo "测试报告"
+                echo "========"
+                echo "设备: \$DEV_URL"
+                echo "时间: \$(date '+%Y-%m-%d %H:%M:%S')"
+                echo "项目: ${projectName}"
+                echo "构建: ${buildNumber}"
+                echo "版本: ${customerVersion}"
+                echo ""
+                echo "测试结果:"
+                echo "--------"
+            } > \${WORKSPACE}/test_summary_${summaryFileName}.txt
+            
+            # ✅ 追加测试详细报告（从新的独立目录读取）
+            if [ -f "\${BUILD_RESULT_DIR}/output_result/allure_report_"*".txt" ]; then
+                cat \${BUILD_RESULT_DIR}/output_result/allure_report_*.txt >> \${WORKSPACE}/test_summary_${summaryFileName}.txt
+            else
+                echo "暂无详细测试报告" >> \${WORKSPACE}/test_summary_${summaryFileName}.txt
+            fi
+            
+            # ✅ 添加测试执行状态信息（供MessageStep解析）
+            # 注意：这里需要传入Groovy变量到shell，所以我们在外部设置
+            echo "" >> \${WORKSPACE}/test_summary_${summaryFileName}.txt
+            echo "测试执行状态:" >> \${WORKSPACE}/test_summary_${summaryFileName}.txt
+            echo "-------------" >> \${WORKSPACE}/test_summary_${summaryFileName}.txt
+            
+            # 追加阶段时长
+            {
+                echo ""
+                echo "阶段时长:"
+                echo "--------"
+                echo "环境设置:     \${SETUP_SEC} 秒"
+                echo "设备锁定:     \${LOCK_SEC} 秒"
+                echo "固件更新:     \${UPDATE_SEC} 秒"
+                echo "测试执行:     \${EXECUTE_SEC} 秒"
+                echo "结果收集:     \${COLLECT_SEC} 秒"
+                echo "设备解锁:     \${UNLOCK_SEC} 秒"
+                echo "----------------"
+                echo "总计:         \${TOTAL_SEC} 秒"
+            } >> \${WORKSPACE}/test_summary_${summaryFileName}.txt
+
+            # 调试：检查文件是否生成
+            if [ -f "\${WORKSPACE}/test_summary_${summaryFileName}.txt" ]; then
+                echo >&2 "✅ 测试总结文件已生成: \${WORKSPACE}/test_summary_${summaryFileName}.txt"
+                ls -la \${WORKSPACE}/test_summary_${summaryFileName}.txt >&2
+            else
+                echo >&2 "❌ 测试总结文件生成失败"
+            fi
+            
+            END_TIME=\$(get_timestamp_ms)
+            COLLECT_DURATION=\$((END_TIME - START_TIME))
+
+            # 步骤6: 解锁设备
+            echo >&2 "步骤6: 解锁设备"
+            START_TIME=\$(get_timestamp_ms)
+            
+            echo >&2 "解锁设备: \$DEV_URL"
+            curl -s -b ~/cookies.txt -X POST "\${DEV_URL}unlock" && echo >&2 "设备解锁成功" || echo >&2 "WARN: 设备解锁可能失败"
+
+            # 清理临时文件
+            rm -f /tmp/device_url.txt
+            
+            END_TIME=\$(get_timestamp_ms)
+            UNLOCK_DURATION=\$((END_TIME - START_TIME))
+
+            # 计算总耗时（毫秒和秒）
+            TOTAL_MS=\$(( \${SETUP_DURATION} + \${LOCK_DURATION} + \${UPDATE_DURATION} + \${EXECUTE_DURATION} + \${COLLECT_DURATION} + \${UNLOCK_DURATION} ))
+            TOTAL_SEC=\$(( \${TOTAL_MS} / 1000 ))
+            
+            # ✅ 输出时长结果到stdout（供TestStep读取），同时保存到文件
+            echo "SETUP_DURATION=\${SETUP_DURATION}"
+            echo "LOCK_DURATION=\${LOCK_DURATION}"
+            echo "UPDATE_DURATION=\${UPDATE_DURATION}"
+            echo "EXECUTE_DURATION=\${EXECUTE_DURATION}"
+            echo "COLLECT_DURATION=\${COLLECT_DURATION}"
+            echo "UNLOCK_DURATION=\${UNLOCK_DURATION}"
+            echo "TOTAL_MS=\${TOTAL_MS}"
+            echo "TOTAL_SEC=\${TOTAL_SEC}"
+            
+            # 同时保存到文件以备后续使用
+            {
+                echo "SETUP_DURATION=\${SETUP_DURATION}"
+                echo "LOCK_DURATION=\${LOCK_DURATION}"
+                echo "UPDATE_DURATION=\${UPDATE_DURATION}"
+                echo "EXECUTE_DURATION=\${EXECUTE_DURATION}"
+                echo "COLLECT_DURATION=\${COLLECT_DURATION}"
+                echo "UNLOCK_DURATION=\${UNLOCK_DURATION}"
+                echo "TOTAL_MS=\${TOTAL_MS}"
+                echo "TOTAL_SEC=\${TOTAL_SEC}"
+            } > \${WORKSPACE}/test_durations.txt
+            
+            echo >&2 "所有测试阶段完成，时长统计已输出"
+            echo >&2 "总耗时: \${TOTAL_SEC} 秒 (\${TOTAL_MS} 毫秒)"
+            """,
+            returnStatus: true
+        )
+
+        // 根据exit code判断结果
+        if (scriptStatus == 0) {
+            testResult = 'SUCCESS'
+        } else if (scriptStatus == 2) {
+            testResult = 'RETRY'
+            // ✅ 明确设置失败原因，防止发送无数据邮件
+            env.TEST_FAILURE_REASON = 'DEVICE_BUSY'
+        } else {
+            testResult = 'FAILURE'
+        }
+
+        // 从文件读取时长信息
+        def durationsFile = "${env.WORKSPACE}/test_durations.txt"
+        if (fileExists(durationsFile)) {
+            echo "=== 读取时长统计文件 ==="
+            def durationsContent = readFile(file: durationsFile)
+            echo "文件内容:\n${durationsContent}"
+            
+            def durationLines = durationsContent.split('\n')
+            for (line in durationLines) {
+                line = line.trim()
+                if (line.startsWith('SETUP_DURATION=')) {
+                    def value = line.split('=')[1].trim()
+                    stageDurations['setup'] = (value.toLong() / 1000.0)
+                    echo "解析 SETUP_DURATION: ${value} -> ${stageDurations['setup']}s"
+                } else if (line.startsWith('LOCK_DURATION=')) {
+                    def value = line.split('=')[1].trim()
+                    stageDurations['lock'] = (value.toLong() / 1000.0)
+                    echo "解析 LOCK_DURATION: ${value} -> ${stageDurations['lock']}s"
+                } else if (line.startsWith('UPDATE_DURATION=')) {
+                    def value = line.split('=')[1].trim()
+                    stageDurations['update'] = (value.toLong() / 1000.0)
+                    echo "解析 UPDATE_DURATION: ${value} -> ${stageDurations['update']}s"
+                } else if (line.startsWith('EXECUTE_DURATION=')) {
+                    def value = line.split('=')[1].trim()
+                    stageDurations['execute'] = (value.toLong() / 1000.0)
+                    echo "解析 EXECUTE_DURATION: ${value} -> ${stageDurations['execute']}s"
+                } else if (line.startsWith('COLLECT_DURATION=')) {
+                    def value = line.split('=')[1].trim()
+                    stageDurations['collect'] = (value.toLong() / 1000.0)
+                    echo "解析 COLLECT_DURATION: ${value} -> ${stageDurations['collect']}s"
+                } else if (line.startsWith('UNLOCK_DURATION=')) {
+                    def value = line.split('=')[1].trim()
+                    stageDurations['unlock'] = (value.toLong() / 1000.0)
+                    echo "解析 UNLOCK_DURATION: ${value} -> ${stageDurations['unlock']}s"
+                }
+            }
+            echo "=== 时长统计解析完成 ==="
+            echo "stageDurations: ${stageDurations}"
+        } else {
+            echo "⚠️ 警告: 时长统计文件不存在: ${durationsFile}"
+        }
+
+        echo "=== 单个测试任务成功完成 ==="
+
+    } catch (Exception e) {
+        echo "测试执行异常: ${e.getMessage()}"
+        testResult = 'FAILURE'
+
+        // 确保设备被解锁
+        if (env.CURRENT_DEVICE_URL) {
+            try {
+                unlockDevice(env.CURRENT_DEVICE_URL)
+            } catch (unlockException) {
+                echo "解锁设备时发生异常: ${unlockException.getMessage()}"
+            }
+        }
+    }
+
+    // 处理测试结果
+    if (testResult == 'SUCCESS') {
+        // ✅ 使用Instance构建号的独立目录结构进行 stash
+        def instanceBuildNumber = env.BUILD_NUMBER  // Instance 自己的构建号
+        def buildResultPath = "output_result/${instanceBuildNumber}"
+        
+        echo "检查测试结果目录: ${buildResultPath}/reports"
+        
+        if (fileExists("${buildResultPath}/reports")) {
+            // ✅ 修复：使用统一的stash命名规则（替换特殊字符）
+            def safeProjectName = taskInfo.project_name?.replaceAll('[/_]', '-') ?: 'unknown'
+            def safeBuildNumber = taskInfo.build_number?.toString()?.replaceAll('[/_]', '-') ?: 'unknown'
+            def stashName = "allure-results-${safeProjectName}-${safeBuildNumber}"
+            
+            echo "✅ 准备 stash 测试结果: ${buildResultPath}"
+            echo "   Instance 构建号: ${instanceBuildNumber}"
+            echo "   Stash 名称: ${stashName}"
+            stash name: stashName, includes: "${buildResultPath}/**"
+            echo "✅ 已 stash 测试结果: ${buildResultPath}"
+        } else {
+            echo "⚠️ 警告: 测试报告目录不存在: ${buildResultPath}/reports"
+            
+            // 调试：列出 output_result 目录内容
+            sh """
+                echo "📁 调试: output_result 目录内容:"
+                ls -la ${env.WORKSPACE}/output_result/ || echo "output_result 目录不存在"
+            """
+        }
+    }
+
+    return testResult
+}
+
+// ==================== 工具函数 ====================
+
+def setupTestEnvironment(taskInfo) {
+    echo "开始设置测试环境..."
+
+    def result = sh(
+        script: """
+        #!/bin/bash
+        set -e
+
+        # 1. 基础配置
+        BASE_URL="https://rainier.lango-tech.com/v1"
+        if [ "\${taskInfo.upload_server}" = "ChangSha" ]; then
+            SERVER_PREFIX="http://csfile.lango-tech.com:10012/firmware"
+        else
+            SERVER_PREFIX="http://gzfile.lango-tech.com:10012/firmware"
+        fi
+        REASON="InstanceTest-\${taskInfo.project_name}-\${taskInfo.build_number}"
+
+        # 2. 构建固件URL
+        FIRMWARE_URL="\${SERVER_PREFIX}/\${taskInfo.firmware_path ?: 'null'}"
+        echo "构建固件URL: \${FIRMWARE_URL}"
+        if [ "\${FIRMWARE_URL##*/}" = "null" ] || [ -z "\${taskInfo.firmware_path}" ]; then
+            echo "ERROR: 固件URL为null，退出测试"
+            exit 1
+        fi
+
+        # 3. 配置SSH环境并获取测试脚本
+        echo "配置SSH环境..."
+        mkdir -p ~/.ssh
+        install -m 0600 "\${GIT_SSH_KEY}" ~/.ssh/id_rsa
+        ssh-keyscan -p 29418 192.168.1.92 > ~/.ssh/known_hosts 2>/dev/null
+
+        # 设置GIT_SSH_COMMAND使用工作空间的私钥
+        # export GIT_SSH_COMMAND="ssh -i \${WORKSPACE}/.ssh/id_rsa -o UserKnownHostsFile=\${WORKSPACE}/.ssh/known_hosts"
+
+        echo "获取测试脚本..."
+        rm -rf LangoAutoTestScripts
+        git clone -b developer_common ssh://git@192.168.1.92:29418/LangoAutoTestScripts.git || {
+            echo "ERROR: 无法获取测试脚本"
+            exit 1
+        }
+
+        cd LangoAutoTestScripts
+        python3 scripts/package.py --customer_name \${taskInfo.board_type} || {
+            echo "ERROR: 打包测试脚本失败"
+            exit 1
+        }
+
+        echo "测试环境设置完成"
+        """,
+        returnStatus: true
+    )
+
+    if (result != 0) {
+        error "设置测试环境失败"
+    }
+
+    echo "测试环境设置成功"
+}
+
+def findAndLockDevice(taskInfo) {
+    echo "开始查找和锁定设备..."
+
+    def result = sh(
+        script: """
+        #!/bin/bash
+        set -e
+
+        BASE_URL="https://rainier.lango-tech.com/v1"
+        REASON="\$(basename \$0)@\$(cat /etc/hostname)"
+        MAX_RETRIES=\${params.DEVICE_LOCK_MAX_RETRIES}
+        LOCK_DURATION=10800
+        RETRY_DELAY=5
+
+        echo "设备查找参数:"
+        echo "  项目: \${taskInfo.project_name}"
+        echo "  构建: \${taskInfo.build_number}"
+        echo "  板型: \${taskInfo.test_board_type}"
+        echo "  设备名: \${taskInfo.agent_name ?: '未指定'}"
+
+        current_retry=0
+        locked=0
+        DEV_URL=""
+
+        while [ \$current_retry -lt \$MAX_RETRIES ]; do
+            echo "=== 设备锁定尝试 \$((current_retry+1))/\$MAX_RETRIES ==="
+
+            if [ -z "\${taskInfo.agent_name}" ] || [ "\${taskInfo.agent_name}" = "null" ]; then
+                echo "使用BOARD参数查找设备: \${taskInfo.test_board_type}"
+                DEV_URL=\$(curl -s -b ~/cookies.txt "\${BASE_URL}/list?BOARD=\${taskInfo.test_board_type}&LOCK_REASON=\$REASON|" | jq -r '.[] | .URL' | head -n1)
+            else
+                echo "使用NAME参数查找设备: \${taskInfo.agent_name}"
+                DEV_URL=\$(curl -s -b ~/cookies.txt "\${BASE_URL}/list?NAME=\${taskInfo.agent_name}&LOCK_REASON=\$REASON|" | jq -r '.[] | .URL' | head -n1)
+            fi
+
+            if [ -z "\$DEV_URL" ]; then
+                echo "WARN: 没有找到可用设备，尝试 \$((current_retry+1))/\$MAX_RETRIES"
+                current_retry=\$((current_retry + 1))
+                if [ \$current_retry -lt \$MAX_RETRIES ]; then
+                    echo "等待 \$RETRY_DELAY 秒后重试..."
+                    sleep \$RETRY_DELAY
+                fi
+                continue
+            fi
+
+            echo "尝试锁定设备: \$DEV_URL"
+            LOCK_INFO=\$(curl -s -b ~/cookies.txt -X POST "\${DEV_URL}lock" \\
+                -H "Content-Type: application/json" \\
+                -d '{"reason": "'\$REASON'", "duration": '\$LOCK_DURATION'}')
+
+            if [ -n "\$(echo "\$LOCK_INFO" | grep "Locked")" ]; then
+                locked=1
+                echo "SUCCESS: 成功锁定设备 \$DEV_URL"
+                echo "\$DEV_URL" > /tmp/device_url.txt
+                break
+            else
+                echo "WARN: 锁定设备 \$DEV_URL 失败: \$LOCK_INFO"
+                current_retry=\$((current_retry + 1))
+                if [ \$current_retry -lt \$MAX_RETRIES ]; then
+                    echo "等待 \$RETRY_DELAY 秒后重试..."
+                    sleep \$RETRY_DELAY
+                fi
+                DEV_URL=""
+            fi
+        done
+
+        if [ \$locked -ne 1 ]; then
+            echo "ERROR: 多次尝试后仍无法锁定设备"
+            exit 2
+        fi
+
+        echo "设备锁定成功: \$DEV_URL"
+        """,
+        returnStatus: true
+    )
+
+    if (result == 2) {
+        echo "设备锁定失败，需要重试"
+        return null
+    } else if (result != 0) {
+        error "查找和锁定设备失败"
+    }
+
+    // 读取设备URL
+    def devUrl = sh(
+        script: "cat /tmp/device_url.txt 2>/dev/null || echo ''",
+        returnStdout: true
+    ).trim()
+
+    if (!devUrl) {
+        error "无法获取设备URL"
+    }
+
+    echo "设备锁定成功: ${devUrl}"
+    return devUrl
+}
+
+def updateFirmware(devUrl, taskInfo) {
+    echo "开始更新固件..."
+
+    def result = sh(
+        script: """
+        #!/bin/bash
+        set -e
+
+        # 构建固件URL
+        if [ "\${taskInfo.upload_server}" = "ChangSha" ]; then
+            SERVER_PREFIX="http://csfile.lango-tech.com:10012/firmware"
+        else
+            SERVER_PREFIX="http://gzfile.lango-tech.com:10012/firmware"
+        fi
+        FIRMWARE_URL="\${SERVER_PREFIX}/\${taskInfo.firmware_path ?: 'null'}"
+
+        echo "固件URL: \${FIRMWARE_URL}"
+        echo "目标设备: \${devUrl}"
+
+        echo "开始固件升级..."
+        curl -s -b ~/cookies.txt "${devUrl}update?url=\${FIRMWARE_URL}" || {
+            echo "ERROR: 固件升级失败"
+            exit 1
+        }
+
+        echo "固件更新完成"
+        """,
+        returnStatus: true
+    )
+
+    if (result != 0) {
+        error "固件更新失败"
+    }
+
+    echo "固件更新成功"
+}
+
+def executeTest(devUrl) {
+    echo "开始执行测试..."
+
+    def result = sh(
+        script: """
+        #!/bin/bash
+        set -e
+
+        echo "检查测试包是否存在..."
+        if [ ! -f "./test_package.zip" ]; then
+            echo "ERROR: 测试包不存在"
+            exit 1
+        fi
+
+        echo "等待3分钟后开始执行测试..."
+        sleep 180
+
+        echo "开始执行测试..."
+        echo "目标设备: \${devUrl}"
+
+        curl -s -X POST -b ~/cookies.txt "\${devUrl}run" \\
+            -H "Content-Type: application/zip" \\
+            --data-binary @test_package.zip || {
+            echo "ERROR: 测试执行失败"
+            exit 1
+        }
+
+        echo "测试执行完成"
+        """,
+        returnStatus: true
+    )
+
+    if (result != 0) {
+        error "测试执行失败"
+    }
+
+    echo "测试执行成功"
+}
+
+def collectTestResults(devUrl, taskInfo, stageDurations) {
+    echo "开始收集测试结果..."
+
+    def result = sh(
+        script: """
+        #!/bin/bash
+        set -e
+
+        echo "获取测试日志..."
+        rm -rf test_result.log test_result.zip
+        curl -s -b ~/cookies.txt -o test_result.log "\${devUrl}run?type=log" || {
+            echo "ERROR: 获取测试日志失败"
+            exit 1
+        }
+
+        echo "获取测试结果压缩包..."
+        curl -s -b ~/cookies.txt -o test_result.zip "\${devUrl}run?type=zip" || {
+            echo "ERROR: 获取测试结果压缩包失败"
+            exit 1
+        }
+
+        echo "处理测试结果文件..."
+        mv test_result.log \${WORKSPACE}/test_result.log
+        mv test_result.zip \${WORKSPACE}/test_result.zip
+
+        rm -rf \${WORKSPACE}/output_result/
+        rm -rf \${WORKSPACE}/allure-report/
+        rm -rf \${WORKSPACE}/output_report/
+        mkdir -p \${WORKSPACE}/output_result/
+        mkdir -p \${WORKSPACE}/allure-report/
+        chmod -R 755 \${WORKSPACE}/output_result
+
+        echo "解压测试结果..."
+        unzip -o \${WORKSPACE}/test_result.zip -d \${WORKSPACE}/output_result || {
+            echo "WARN: 解压测试结果文件失败"
+        }
+
+        echo "测试结果收集完成"
+        echo "注意: 测试总结报告已由主测试脚本生成，包含完整的时长统计信息"
+        """,
+        returnStatus: true
+    )
+
+    if (result != 0) {
+        error "收集测试结果失败"
+    }
+
+    echo "测试结果收集成功"
+}
+
+def unlockDevice(devUrl) {
+    echo "开始解锁设备..."
+
+    def result = sh(
+        script: """
+        #!/bin/bash
+
+        echo "解锁设备: \${devUrl}"
+        curl -s -b ~/cookies.txt -X POST "\${devUrl}unlock" && echo "设备解锁成功" || echo "WARN: 设备解锁可能失败"
+
+        # 清理临时文件
+        rm -f /tmp/device_url.txt
+        """,
+        returnStatus: true
+    )
+
+    if (result != 0) {
+        echo "WARN: 设备解锁时出现问题，但继续执行"
+    } else {
+        echo "设备解锁成功"
+    }
+}
+def getFailureReasonText(reason) {
+    def reasonMap = [
+        'DEVICE_BUSY': '设备占用',
+        'FIRMWARE_UPDATE_FAILED': '固件更新失败',
+        'TEST_PACKAGE_MISSING': '测试包不存在',
+        'GIT_CLONE_FAILED': 'Git克隆失败',
+        'TEST_PACKAGE_BUILD_FAILED': '测试包生成失败',
+        'TEST_LOG_FETCH_FAILED': '测试日志获取失败',
+        'TEST_RESULT_FETCH_FAILED': '测试结果获取失败',
+        'UNKNOWN': '未知错误'
+    ]
+    
+    return reasonMap[reason] ?: reason
+}
+
+def parseJsonToMap(String jsonString) {
+    if (!jsonString) return [:]
+    def parsed = new groovy.json.JsonSlurper().parseText(jsonString)
+    if (parsed instanceof groovy.json.internal.LazyMap) {
+        return new HashMap(parsed)
+    }
+    return parsed
+}
+
+// ==================== 即时专属通知功能 ====================
+
+def sendImmediateNotification(taskInfo) {
+    echo "开始发送即时专属通知: ${taskInfo.project_name}-${taskInfo.build_number}"
+
+    // 🚫 设备占用时，不发送邮件（无论是否最后一次重试）
+    if (env.TEST_FAILURE_REASON == "DEVICE_BUSY") {
+        echo "🚫 检测到失败原因为 DEVICE_BUSY，跳过发送即时专属通知"
+        return
+    }
+
+    // 收集当前Instance的测试结果信息
+    def instanceInfo = collectCurrentInstanceInfo(taskInfo)
+
+    // 判断测试状态
+    def buildResult = currentBuild.currentResult
+    def taskStatus = ""
+    def statusIcon = ""
+    def statusClass = ""
+
+    if (buildResult == 'SUCCESS') {
+        taskStatus = "成功"
+        statusIcon = "✅"
+        statusClass = "success"
+    } else if (buildResult == 'UNSTABLE') {
+        if (env.TEST_EXECUTION_SUCCESS == 'true' || env.TEST_FAILURE_REASON == 'TEST_CASES_FAILED') {
+            taskStatus = "部分用例失败"
+            statusIcon = "⚠️"
+            statusClass = "warning"
+        } else {
+            taskStatus = "失败"
+            statusIcon = "❌"
+            statusClass = "failure"
+        }
+    } else {
+        taskStatus = "失败"
+        statusIcon = "❌"
+        statusClass = "failure"
+    }
+
+    // ⚠️ 当通过率为 0% 时，强制视为测试失败（避免误判为“部分用例失败”）
+    try {
+        if (instanceInfo.passRate && instanceInfo.passRate != 'N/A') {
+            def passRateValue = instanceInfo.passRate.replaceAll('%', '').toFloat()
+            if (passRateValue == 0.0 && statusClass != 'failure') {
+                echo "检测到通过率为 0%，将邮件状态强制标记为失败"
+                taskStatus = "失败"
+                statusIcon = "❌"
+                statusClass = "failure"
+            }
+        }
+    } catch (Exception e) {
+        echo "解析通过率时出错，保持原有状态: ${e.getMessage()}"
+    }
+
+    // 生成邮件内容
+    def emailSubject = "${statusIcon} 自动测试${taskStatus}通知 - ${taskInfo.project_real_name ?: taskInfo.project_name} #${taskInfo.build_number}"
+    def emailBody = generateImmediateNotificationEmail(taskInfo, instanceInfo, taskStatus, statusIcon, statusClass)
+
+    try {
+        emailext(
+            to: taskInfo.recipient_list,
+            subject: emailSubject,
+            mimeType: 'text/html',
+            body: emailBody
+        )
+        echo "✅ 已发送即时专属通知到: ${taskInfo.recipient_list}"
+    } catch (Exception e) {
+        echo "❌ 发送即时专属通知失败: ${e.getMessage()}"
+        echo "   StackTrace: ${e.getStackTrace().join('\n')}"
+    }
+}
+
+
+def collectCurrentInstanceInfo(taskInfo) {
+    // 收集当前Instance的测试结果信息（增强版：包含完整Allure报告数据）
+    def instanceInfo = [
+        buildNumber: env.BUILD_NUMBER ?: 'N/A',
+        buildUrl: env.BUILD_URL ?: '#',
+        testResult: currentBuild.currentResult,
+        // 基础统计
+        passRate: 'N/A',
+        passedTests: 0,
+        totalTests: 0,
+        // 详细统计（Allure完整数据）
+        totalCases: 0,           // 总用例数量（包括跳过的）
+        failedTests: 0,          // 失败数量
+        skippedTests: 0,         // 跳过数量
+        brokenTests: 0,          // 中断数量
+        unknownTests: 0,         // 未知数量
+        failureRate: 'N/A',      // 失败率
+        brokenRate: 'N/A',       // 中断率
+        avgExecutionTime: 'N/A', // 平均执行时间
+        // 其他信息
+        duration: 'N/A',
+        stageDurations: [:],
+        testDevice: taskInfo.agent_name ?: '未指定',
+        failureReason: env.TEST_FAILURE_REASON ?: 'NONE'
+    ]
+    
+    try {
+        // 先unstash测试总结文件到当前WORKSPACE
+        def taskInfoUnstash = parseJsonToMap(env.TASK_INFO_JSON ?: '{}')
+        def safeProjectName = taskInfoUnstash.project_name?.replaceAll('[/_]', '-') ?: 'unknown'
+        def safeBuildNumber = taskInfoUnstash.build_number?.toString()?.replaceAll('[/_]', '-') ?: 'unknown'
+        def stashName = "test-summary-${safeProjectName}-${safeBuildNumber}"
+        echo "Unstash 测试总结文件: ${stashName}"
+        unstash name: stashName
+        
+        // 尝试从测试总结文件读取详细测试结果
+        def summaryFile = "test_summary_${params.TASK_FILE_NAME.replace('.json', '')}.txt"
+        def summaryPath = "${env.WORKSPACE}/${summaryFile}"
+        
+        if (fileExists(summaryPath)) {
+            def summaryContent = readFile(summaryPath)
+            echo "读取测试总结文件内容"
+            
+            // ✅ 解析总用例数量（包括跳过的）
+            def totalCasesPattern = /总用例数量\s+(\d+)/
+            def totalCasesMatcher = summaryContent =~ totalCasesPattern
+            if (totalCasesMatcher.find()) {
+                instanceInfo.totalCases = totalCasesMatcher[0][1].toInteger()
+                echo "提取到总用例数量: ${instanceInfo.totalCases}"
+            }
+            
+            // ✅ 解析通过数量
+            def passedPattern = /通过数量\s+(\d+)/
+            def passedMatcher = summaryContent =~ passedPattern
+            if (passedMatcher.find()) {
+                instanceInfo.passedTests = passedMatcher[0][1].toInteger()
+                echo "提取到通过数量: ${instanceInfo.passedTests}"
+            }
+            
+            // ✅ 解析失败数量
+            def failedPattern = /失败数量\s+(\d+)/
+            def failedMatcher = summaryContent =~ failedPattern
+            if (failedMatcher.find()) {
+                instanceInfo.failedTests = failedMatcher[0][1].toInteger()
+                echo "提取到失败数量: ${instanceInfo.failedTests}"
+            }
+            
+            // ✅ 解析跳过数量
+            def skippedPattern = /跳过数量\s+(\d+)/
+            def skippedMatcher = summaryContent =~ skippedPattern
+            if (skippedMatcher.find()) {
+                instanceInfo.skippedTests = skippedMatcher[0][1].toInteger()
+                echo "提取到跳过数量: ${instanceInfo.skippedTests}"
+            }
+            
+            // ✅ 解析中断数量
+            def brokenPattern = /中断数量\s+(\d+)/
+            def brokenMatcher = summaryContent =~ brokenPattern
+            if (brokenMatcher.find()) {
+                instanceInfo.brokenTests = brokenMatcher[0][1].toInteger()
+                echo "提取到中断数量: ${instanceInfo.brokenTests}"
+            }
+            
+            // ✅ 解析未知数量
+            def unknownPattern = /未知数量\s+(\d+)/
+            def unknownMatcher = summaryContent =~ unknownPattern
+            if (unknownMatcher.find()) {
+                instanceInfo.unknownTests = unknownMatcher[0][1].toInteger()
+                echo "提取到未知数量: ${instanceInfo.unknownTests}"
+            }
+            
+            // ✅ 解析平均执行时间
+            def avgTimePattern = /平均执行时间\s+([\d.]+)s/
+            def avgTimeMatcher = summaryContent =~ avgTimePattern
+            if (avgTimeMatcher.find()) {
+                instanceInfo.avgExecutionTime = "${avgTimeMatcher[0][1]}s"
+                echo "提取到平均执行时间: ${instanceInfo.avgExecutionTime}"
+            }
+            
+            // ✅ 解析通过率（格式：通过率: XX% (XX/XX)）
+            def passRatePattern = /通过率:\s*([\d.]+)%\s*\((\d+)\/(\d+)\)/
+            def passRateMatcher = summaryContent =~ passRatePattern
+            if (passRateMatcher.find()) {
+                instanceInfo.passRate = "${passRateMatcher[0][1]}%"
+                // totalTests 是有效测试数（不含跳过）
+                instanceInfo.totalTests = passRateMatcher[0][3].toInteger()
+                echo "提取到通过率: ${instanceInfo.passRate}, 有效测试数: ${instanceInfo.totalTests}"
+            }
+            
+            // ✅ 解析失败率
+            def failureRatePattern = /失败率:\s*([\d.]+)%/
+            def failureRateMatcher = summaryContent =~ failureRatePattern
+            if (failureRateMatcher.find()) {
+                instanceInfo.failureRate = "${failureRateMatcher[0][1]}%"
+                echo "提取到失败率: ${instanceInfo.failureRate}"
+            }
+            
+            // ✅ 解析中断率
+            def brokenRatePattern = /中断率:\s*([\d.]+)%/
+            def brokenRateMatcher = summaryContent =~ brokenRatePattern
+            if (brokenRateMatcher.find()) {
+                instanceInfo.brokenRate = "${brokenRateMatcher[0][1]}%"
+                echo "提取到中断率: ${instanceInfo.brokenRate}"
+            }
+            
+            // 解析阶段时长（格式：阶段名: XX.XX 秒）
+            def stageDurationPattern = /(\S+):\s*([\d.]+)\s*秒/
+            summaryContent.findAll(stageDurationPattern).each { match ->
+                def parts = match.split(':')
+                if (parts.size() == 2) {
+                    def stageName = parts[0].trim()
+                                        
+                    // 排除总计项，避免重复计算
+                    if (stageName.contains("总用时") || stageName.contains("总计")) {
+                        return
+                    }
+                    def duration = parts[1].replaceAll(/[^\d.]/, '').trim()
+                    if (duration) {
+                        instanceInfo.stageDurations[stageName] = duration
+                    }
+                }
+            }
+            
+            echo "提取到 ${instanceInfo.stageDurations.size()} 个阶段时长"
+        } else {
+            echo "测试总结文件不存在: ${summaryPath}"
+        }
+        
+        // 从时长文件读取阶段时长（作为备选方案）
+        def durationsFile = "${env.WORKSPACE}/test_durations.txt"
+        if (fileExists(durationsFile) && instanceInfo.stageDurations.size() == 0) {
+            echo "=== 从时长文件读取阶段时长 ==="
+            def durationsContent = readFile(durationsFile)
+            echo "时长文件内容:\n${durationsContent}"
+            
+            def stageMapping = [
+                'SETUP_DURATION': '环境设置',
+                'LOCK_DURATION': '设备锁定',
+                'UPDATE_DURATION': '固件更新',
+                'EXECUTE_DURATION': '测试执行',
+                'COLLECT_DURATION': '结果收集',
+                'UNLOCK_DURATION': '设备解锁'
+            ]
+            
+            durationsContent.split('\n').each { line ->
+                line = line.trim()
+                if (line.contains('=')) {
+                    def parts = line.split('=', 2)
+                    if (parts.size() == 2) {
+                        def key = parts[0].trim()
+                        def value = parts[1].trim()
+                        
+                        // 跳过 TOTAL_MS 和 TOTAL_SEC
+                        if (key in ['TOTAL_MS', 'TOTAL_SEC']) {
+                            return
+                        }
+                        
+                        // 转换为中文名称和秒
+                        if (stageMapping.containsKey(key)) {
+                            try {
+                                def seconds = (value.toLong() / 1000.0)
+                                instanceInfo.stageDurations[stageMapping[key]] = String.format("%.2f", seconds)
+                                echo "解析 ${key} -> ${stageMapping[key]}: ${value}ms = ${seconds}s"
+                            } catch (Exception e) {
+                                echo "解析时长失败: ${key} = ${value}, 错误: ${e.getMessage()}"
+                            }
+                        }
+                    }
+                }
+            }
+            echo "从时长文件提取到 ${instanceInfo.stageDurations.size()} 个阶段时长"
+            echo "stageDurations: ${instanceInfo.stageDurations}"
+        }
+        
+        // 计算总时长
+        def totalDuration = 0.0
+        instanceInfo.stageDurations.each { stage, duration ->
+            try {
+                totalDuration += duration.toFloat()
+            } catch (Exception e) {
+                // 忽略转换错误
+            }
+        }
+        if (totalDuration > 0) {
+            instanceInfo.duration = String.format("%.2f", totalDuration / 60.0) + " 分钟"
+        }
+        
+        // ✅ 根据测试通过率判定实际测试结果（软件测试报告结论）
+        // 通过率 >= 95%: 通过，通过率 < 95%: 失败
+        def actualTestResult = "失败"  // 默认失败
+        def actualTestResultStyle = "color: #f44336; font-weight: bold;"  // 红色
+        if (instanceInfo.passRate != 'N/A') {
+            try {
+                def passRateValue = instanceInfo.passRate.replaceAll('%', '').toFloat()
+                if (passRateValue >= 95.0) {
+                    actualTestResult = "通过"
+                    actualTestResultStyle = "color: #4CAF50; font-weight: bold;"  // 绿色
+                } else {
+                    actualTestResult = "失败"
+                    actualTestResultStyle = "color: #f44336; font-weight: bold;"  // 红色
+                }
+                echo "=== 测试结果判定 ==="
+                echo "通过率: ${instanceInfo.passRate}"
+                echo "判定结果: ${actualTestResult} (阈值: 95%)"
+                echo "==================="
+            } catch (Exception e) {
+                echo "解析通过率失败，使用默认结果: 失败"
+                echo "错误: ${e.getMessage()}"
+            }
+        } else {
+            echo "通过率不可用 (N/A)，使用默认结果: 失败"
+        }
+        instanceInfo.actualTestResult = actualTestResult
+        instanceInfo.actualTestResultStyle = actualTestResultStyle
+        
+    } catch (Exception e) {
+        echo "收集Instance信息时出错: ${e.getMessage()}"
+    }
+    
+    return instanceInfo
+}
+
+def generateImmediateNotificationEmail(taskInfo, instanceInfo, taskStatus, statusIcon, statusClass) {
+    // 格式化时间
+    def createdTime = taskInfo.created_time ?: 'Unknown'
+    def currentTime = new Date().format('yyyy-MM-dd HH:mm:ss')
+    
+    // 生成阶段时长表格行（两格表格格式）
+    def stageDurationsHtml = ""
+    if (instanceInfo.stageDurations && instanceInfo.stageDurations.size() > 0) {
+        def stages = instanceInfo.stageDurations.collect { k, v -> [stage: k, duration: v] }
+        def stageDurationRows = []
+        
+        // 每两个阶段一行，保持两格表格格式
+        for (int i = 0; i < stages.size(); i += 2) {
+            def stage1 = stages[i]
+            def stage2 = (i + 1 < stages.size()) ? stages[i + 1] : null
+            
+            // 格式化第一个阶段时长
+            def formattedDuration1 = stage1.duration
+            try {
+                def durationValue = stage1.duration.toString().toFloat()
+                formattedDuration1 = String.format("%.1f", durationValue)
+            } catch (Exception e) {
+                // 如果转换失败，保持原值
+            }
+            
+            // 格式化第二个阶段时长（如果存在）
+            def formattedDuration2 = stage2 ? stage2.duration : ''
+            if (stage2) {
+                try {
+                    def durationValue = stage2.duration.toString().toFloat()
+                    formattedDuration2 = String.format("%.1f", durationValue)
+                } catch (Exception e) {
+                    // 如果转换失败，保持原值
+                }
+            }
+            
+            if (stage2) {
+                stageDurationRows << """
+                <tr>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333; width: 25%;">${stage1.stage}</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666; width: 25%;"><strong>${formattedDuration1}</strong> 秒</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333; width: 25%;">${stage2.stage}</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666; width: 25%;"><strong>${formattedDuration2}</strong> 秒</td>
+                </tr>
+                """
+            } else {
+                // 只有一个阶段的情况，后两格留空
+                stageDurationRows << """
+                <tr>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333; width: 25%;">${stage1.stage}</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666; width: 25%;"><strong>${formattedDuration1}</strong> 秒</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; width: 25%;"></td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; width: 25%;"></td>
+                </tr>
+                """
+            }
+        }
+        stageDurationsHtml = stageDurationRows.join('')
+    }
+    
+    // 测试结果颜色
+    def resultColor = '#4CAF50'  // 默认绿色
+    if (statusClass == 'failure') {
+        resultColor = '#f44336'  // 红色
+    } else if (statusClass == 'warning') {
+        resultColor = '#FF9800'  // 橙色
+    }
+    
+    def passRateColor = '#2196F3'  // 默认蓝色
+    if (instanceInfo.passRate != 'N/A') {
+        try {
+            def rate = instanceInfo.passRate.replaceAll('%', '').toFloat()
+            // ✅ 通过率颜色规则：≥95%绿色，50-94%橙色，<50%红色
+            passRateColor = rate >= 95 ? '#4CAF50' : (rate >= 50 ? '#FF9800' : '#f44336')
+        } catch (Exception e) {
+            // 忽略解析错误，使用默认颜色
+        }
+    }
+    
+    // 失败原因文本
+    def failureReasonHtml = ""
+    if (instanceInfo.failureReason && instanceInfo.failureReason != 'NONE') {
+        def reasonText = getFailureReasonText(instanceInfo.failureReason)
+        failureReasonHtml = """
+        <tr>
+            <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-weight: bold; color: #333; width: 25%;">失败原因</td>
+            <td colspan="3" style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; color: #f44336; font-weight: bold; width: 75%;">
+                ${reasonText}
+            </td>
+        </tr>
+        """
+    }
+    
+    def emailBody = """
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <title>自动测试${taskStatus}通知</title>
+    <style type="text/css">
+        body { margin: 0; padding: 0; min-width: 100%; background-color: #f5f7fa; font-family: Arial, sans-serif; font-size: 13px; }
+        table { border-collapse: collapse; }
+        .container { width: 100%; max-width: 650px; margin: 0 auto; padding: 12px; }
+        .header { background: linear-gradient(135deg, ${resultColor} 0%, ${resultColor}dd 100%); color: white; padding: 18px; text-align: center; border-radius: 8px 8px 0 0; }
+        .content { background: white; padding: 18px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.12); }
+        .info-table { width: 100%; border-collapse: collapse; margin: 10px 0; table-layout: fixed; }
+        .info-table td { padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; word-wrap: break-word; word-break: break-all; }
+        .info-table td:nth-child(odd) { font-weight: bold; color: #333; }
+        .info-table td:nth-child(even) { color: #666; }
+        .two-column { display: table; width: 100%; margin: 10px 0; }
+        .column { display: table-cell; width: 49%; vertical-align: top; padding: 0 6px; }
+        .column:first-child { padding-left: 0; }
+        .column:last-child { padding-right: 0; }
+        .status-badge { display: inline-block; padding: 5px 12px; border-radius: 14px; font-weight: bold; color: white; background: ${resultColor}; font-size: 12px; }
+        .pass-rate-badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-weight: bold; color: white; background: ${passRateColor}; font-size: 13px; line-height: 1.4; vertical-align: middle; }
+        .button { display: inline-block; padding: 10px 18px; background: #2196F3; color: white; text-decoration: none; border-radius: 5px; margin: 8px 4px; font-size: 13px; }
+        .button:hover { background: #1976D2; }
+        .footer { text-align: center; color: #999; font-size: 11px; margin-top: 15px; }
+        .highlight { background-color: #fff3cd; padding: 12px; border-left: 4px solid #ffc107; margin: 12px 0; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1 style="margin: 0; font-size: 20px;">${statusIcon} 自动测试${taskStatus}通知</h1>
+            <p style="margin: 8px 0 0 0; opacity: 0.9; font-size: 14px;">项目: ${taskInfo.project_real_name ?: taskInfo.project_name}</p>
+            <p style="margin: 4px 0 0 0; opacity: 0.8; font-size: 12px;">测试完成时间: ${currentTime}</p>
+        </div>
+        
+        <div class="content">
+            ${statusClass == 'warning' ? '<div class="highlight">⚠️ 测试执行完成，但存在部分用例失败，请查看详细报告</div>' : ''}
+            ${statusClass == 'failure' ? '<div class="highlight" style="border-left-color: #f44336; background-color: #ffebee;">❌ 测试执行失败，请尽快查看并处理</div>' : ''}
+            
+            <h2 style="color: #333; border-bottom: 2px solid ${resultColor}; padding-bottom: 8px; margin-top: 15px; margin-bottom: 10px; font-size: 15px; text-align: center;">任务信息</h2>
+            
+            <table class="info-table">
+                <colgroup>
+                    <col style="width: 20%" />
+                    <col style="width: 30%" />
+                    <col style="width: 20%" />
+                    <col style="width: 30%" />
+                </colgroup>
+                <tr>
+                    <td>项目名称</td>
+                    <td colspan="3"><strong>${taskInfo.project_real_name ?: taskInfo.project_name}</strong></td>
+                </tr>
+                <tr>
+                    <td>测试状态</td>
+                    <td><span class="status-badge">${taskStatus}</span></td>
+                    <td>板型类型</td>
+                    <td>${taskInfo.board_type ?: 'N/A'}</td>
+                </tr>
+                <tr>
+                    <td>测试板型</td>
+                    <td>${taskInfo.test_board_type ?: 'N/A'}</td>
+                    <td>测试设备</td>
+                    <td>${instanceInfo.testDevice}</td>
+                </tr>
+                <tr>
+                    <td>客户版本</td>
+                    <td>${taskInfo.customer_version ?: 'N/A'}</td>
+                    <td>固件版本号</td>
+                    <td>${taskInfo.firmware_version ?: 'N/A'}</td>
+                </tr>
+                <tr>
+                    <td>上传服务器</td>
+                    <td>${taskInfo.upload_server ?: 'N/A'}</td>
+                    <td>任务创建时间</td>
+                    <td>${createdTime}</td>
+                </tr>
+            </table>
+            
+            <h2 style="color: #333; border-bottom: 2px solid #2196F3; padding-bottom: 8px; margin-top: 18px; margin-bottom: 10px; font-size: 15px; text-align: center;">📊 测试结果详情</h2>
+            
+            <!-- 总用例数量放在最上面 -->
+            <div style="text-align: center; margin-bottom: 15px; padding: 12px; background: linear-gradient(to right, #e3f2fd 0%, #e8f5e9 100%); border-radius: 6px; border: 1px solid #e0e0e0;">
+                <span style="font-size: 16px; font-weight: bold; color: #1976D2;">📋 总用例数量: <strong style="font-size: 18px; color: #2196F3;">${instanceInfo.totalCases}</strong> 个</span>
+            </div>
+            
+            <table class="info-table">
+                <tr>
+                    <td style="width: 25%;">测试编号</td>
+                    <td style="width: 25%;">
+                        <a href="${instanceInfo.buildUrl}" style="color: #2196F3; text-decoration: none; font-weight: bold;">
+                            #${instanceInfo.buildNumber}
+                        </a>
+                    </td>
+                    <td style="width: 25%;">测试结果</td>
+                    <td style="width: 25%;"><strong style="${instanceInfo.actualTestResultStyle}">${instanceInfo.actualTestResult}</strong></td>
+                </tr>
+                ${failureReasonHtml}
+            </table>
+            
+            <table style="width: 100%; border-collapse: collapse; margin-top: 15px; border: 1px solid #e0e0e0;">
+                <!-- 标题行 -->
+                <tr>
+                    <th colspan="2" style="padding: 10px; background: #f8f9fa; border-bottom: 2px solid #e0e0e0; color: #333; font-size: 14px; text-align: center;">📈 测试用例统计</th>
+                    <th colspan="2" style="padding: 10px; background: #f8f9fa; border-bottom: 2px solid #e0e0e0; border-left: 1px solid #e0e0e0; color: #333; font-size: 14px; text-align: center;">📉 测试质量指标</th>
+                </tr>
+                <!-- 数据行1 -->
+                <tr>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333; width: 25%;">✅ 通过数量</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666; width: 25%;"><strong style="font-size: 14px; color: #4CAF50;">${instanceInfo.passedTests}/${instanceInfo.totalCases - (instanceInfo.skippedTests ?: 0)}</strong></td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; border-left: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333; width: 25%;">✅ 用例通过率</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666; width: 25%;"><span class="pass-rate-badge">${instanceInfo.passRate}</span></td>
+                </tr>
+                <!-- 数据行2 -->
+                <tr>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">❌ 失败数量</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 14px; color: #f44336;">${instanceInfo.failedTests}</strong> 个</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; border-left: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">❌ 用例失败率</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 13px; color: ${instanceInfo.failureRate != 'N/A' && instanceInfo.failureRate.replaceAll('%', '').toFloat() > 0 ? '#f44336' : '#666'};">${instanceInfo.failureRate}</strong></td>
+                </tr>
+                <!-- 数据行3 -->
+                <tr>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">🚫 跳过数量</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 14px; color: #9E9E9E;">${instanceInfo.skippedTests}</strong> 个</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; border-left: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">💥 用例中断率</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 13px; color: ${instanceInfo.brokenRate != 'N/A' && instanceInfo.brokenRate.replaceAll('%', '').toFloat() > 0 ? '#FF5722' : '#666'};">${instanceInfo.brokenRate}</strong></td>
+                </tr>
+                <!-- 数据行4 -->
+                <tr>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">💥 中断数量</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 14px; color: #FF5722;">${instanceInfo.brokenTests}</strong> 个</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; border-left: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">⏱️ 单例平均时</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 13px; color: #2196F3;">${instanceInfo.avgExecutionTime}</strong></td>
+                </tr>
+                <!-- 数据行5 -->
+                <tr>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">❓ 未知数量</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 14px; color: #9E9E9E;">${instanceInfo.unknownTests}</strong> 个</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; border-left: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #333;">⏰ 测试总用时</td>
+                    <td style="padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #666;"><strong style="font-size: 13px; color: #607D8B;">${instanceInfo.duration}</strong></td>
+                </tr>
+            </table>
+            
+            ${stageDurationsHtml ? '<h3 style="color: #333; margin-top: 15px; margin-bottom: 8px; font-size: 14px; text-align: center;">⚙️ 测试阶段用时</h3><table class="info-table">' + stageDurationsHtml + '</table>' : ''}
+            
+            <div style="text-align: center; margin-top: 18px;">
+                <a href="${instanceInfo.buildUrl}" class="button">查看详细构建日志</a>
+                <a href="${instanceInfo.buildUrl}allure/" class="button">查看 Allure 测试报告</a>
+            </div>
+            
+            <div class="footer">
+                <p style="margin: 4px 0;">此邮件由自动测试系统在测试完成后立即发送，请勿回复</p>
+                <p style="margin: 4px 0;">Jenkins 服务器: ${env.JENKINS_URL ?: 'Jenkins'}</p>
+                <p style="margin: 4px 0;">如有疑问，请联系测试团队</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    
+    return emailBody
+}
+
+def extractFirmwareVersion(String firmwarePath) {
+    if (!firmwarePath) return ''
+
+    // 取文件名
+    def fileName = firmwarePath.tokenize('/').last()
+    if (!fileName) return ''
+
+    // 去掉常见后缀
+    fileName = fileName
+        .replaceAll(/\.tar\.gz$/,'')
+        .replaceAll(/\.tgz$/,'')
+        .replaceAll(/\.zip$/,'')
+        .replaceAll(/\.img$/,'')
+
+    def parts = (fileName.split('_') as List)
+    if (!parts || parts.size() < 2) return ''
+
+    // 找到 14 位时间戳 token（如 20260105052412）
+    int tsIndex = -1
+    for (int i = 0; i < parts.size(); i++) {
+        if ((parts[i] ?: '') ==~ /^\d{14}$/) {
+            tsIndex = i
+            break
+        }
+    }
+
+    if (tsIndex < 0) {
+        // 找不到时间戳：回退取末尾 4 段，避免太长
+        return (parts.size() >= 4) ? parts[-4..-1].join('_') : fileName
+    }
+
+    // ✅ 只要「时间戳及其后面」：时间戳前面的全部不要
+    return parts[tsIndex..-1].join('_')
+}
+
+

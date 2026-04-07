@@ -1,0 +1,83 @@
+============================================================
+ROUND 1: Requirements Coverage (FR-001 ~ FR-017)
+============================================================
+  FR-001 [PASS] ONES account login - found: ['verify_ones_login', 'login', 'JWT']
+  FR-002 [PASS] Server list - found: ['list_servers', 'servers']
+  FR-003 [PASS] Credential binding - found: ['verify_credential', 'ssh_password_encrypted', 'AES']
+  FR-004 [PASS] Task creation - found: ['create_task', 'TicketInput', 'normalize_ticket_id']
+  FR-005 [PASS] Task execution SSH - found: ['ssh_conn', 'create_process', 'ones_task_runner']
+  FR-006 [PASS] Real-time logs - found: ['WebSocket', 'subscribe_logs', 'broadcast_log']
+  FR-007 [PASS] Task results - found: ['get_task', 'TaskDetail', 'result_summary']
+  FR-008 [PASS] User evaluation - found: ['submit_evaluation', 'task_evaluations', 'passed']
+  FR-009 [PASS] WeChat notification - found: ['send_wecom_message', 'send_task_notification']
+  FR-010 [PASS] Admin overview - found: ['get_overview', 'OverviewStats']
+  FR-011 [PASS] Admin trends - found: ['get_trends', 'TrendPoint']
+  FR-012 [PASS] Admin user detail - found: ['get_user_detail', 'UserRank']
+  FR-013 [PASS] Admin eval stats - found: ['get_eval_stats', 'pass_rate']
+  FR-014 [PASS] External configs - found: ['external_configs', 'get_configs', 'update_configs']
+  FR-015 [PASS] AI model config - found: ['AI_BASE_URL', 'AI_SONNET_MODEL', 'AI_OPUS_MODEL']
+  FR-016 [PASS] Gerrit placeholder - found: ['GERRIT_HOST', 'GERRIT_TOKEN']
+  FR-017 [PASS] Runner enhancement - found: ['json-output', 'PROGRESS', 'notes']
+
+Coverage: 17/17 (100%)
+
+============================================================
+ROUND 2: Database Schema Verification
+============================================================
+  ✅ users
+  ✅ servers
+  ✅ user_server_credentials
+  ✅ tasks
+  ✅ task_tickets
+  ✅ task_evaluations
+  ✅ task_logs
+  ✅ notification_logs
+  ✅ external_configs
+  Indexes: 11
+
+============================================================
+ROUND 3: API Route Completeness
+============================================================
+  ✅ POST /login in auth.py
+  ✅ GET /me in auth.py
+  ✅ GET /servers in servers.py
+  ✅ POST /verify in servers.py
+  ✅ GET /credentials in servers.py
+  ✅ DELETE /credentials in servers.py
+  ✅ POST /servers in servers.py
+  ✅ POST /health in servers.py
+  ✅ POST /tasks in tasks.py
+  ✅ GET /tasks in tasks.py
+  ✅ GET /tasks/{id} in tasks.py
+  ✅ DELETE /tasks/{id} in tasks.py
+  ✅ POST /evaluations in evaluations.py
+  ✅ GET /evaluations/task in evaluations.py
+  ✅ GET /overview in admin.py
+  ✅ GET /trends in admin.py
+  ✅ GET /users in admin.py
+  ✅ GET /users/{id}/detail in admin.py
+  ✅ GET /evaluations/stats in admin.py
+  ✅ GET /export in admin.py
+  ✅ GET /configs in admin.py
+  ✅ POST /configs in admin.py
+  ✅ WebSocket /ws/tasks/{id}/logs in log_streamer.py
+
+Total routes verified: 23
+
+============================================================
+ROUND 4: Security & Configuration
+============================================================
+  ✅ JWT auth
+  ✅ AES encryption
+  ✅ CORS middleware
+  ✅ Admin role check
+  ✅ Token validation
+  ✅ Password encryption
+  ✅ SSH credential verify
+  ✅ Gerrit placeholder
+  ✅ AI model config
+  ✅ DB connection pool
+
+============================================================
+REVIEW COMPLETE
+============================================================

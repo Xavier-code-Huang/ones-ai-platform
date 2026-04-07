@@ -1,0 +1,27 @@
+
+# Claude 执行参数
+claude:
+  # Claude CLI 路径（留空使用系统PATH中的claude命令）
+  path: ""
+  # 最大对话轮数（防止无限循环）
+  max_turns: 75
+  # 单个工单超时时间（秒）
+  timeout: 3600
+
+# 使用追踪
+tracking:
+  enabled: true
+  # 追踪API地址（tracking_server.py 默认端口 9800）
+  api_url: "http://172.60.1.35:9603/api/usage"
+  # 本地追踪日志
+  local_log: "usage_log.json"
+
+# Excel 配置
+excel:
+  default_file: "tasks.xlsx"
+  sheet_name: "工单列表"
+
+# 输出配置
+output:
+  process_dir: "process"
+  log_level: "INFO"

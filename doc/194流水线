@@ -1,0 +1,2484 @@
+pipeline {
+    agent { label '94-node1' }
+    options {
+        disableConcurrentBuilds()
+    }
+    parameters {
+        choice(
+            name: 'MANUAL_PROJECT',
+            choices: ['Keyguard_Edu2.0','XbhAccount', 'Launcher5.0', 'SystemSetting_Edu2.0','XbhSystemUI','XBHFM','XbhCloudDisk','NavigationEdu2.0','XbhLiveTv','XbhAiServer','XbhAi','XbhAdverPlayer3.0','XbhFactoryMenu','XbhWidgets','XbhUniversalPlayer','XbhAiScreen','Quickpass','XbhFloatMenu','XbhWelcome2.0','XbhSpotlight','XbhBrowser','Votekit','XbhCalendar','XbhTimer','HardwareDetect','Calculator','XbhGallery','XbhScreenRecorder','XbhEyeProtection','SetupWizard','OTA2.0','LOTAUI','XbhFinger','SystemSetting_Edu2.0_public','XBHWhiteBoard4.0','XbhDms','XbhSerialService'],
+            description: '手动触发时选择项目（Gerrit触发自动识别）'
+        )
+        reactiveChoice(
+            name: 'MANUAL_BRANCH_SELECT',
+            choiceType: 'PT_SINGLE_SELECT',
+            description: '手动触发时选择分支',
+            referencedParameters: 'MANUAL_PROJECT',
+            script: new org.biouno.unochoice.model.GroovyScript(
+                new org.jenkinsci.plugins.scriptsecurity.sandbox.groovy.SecureGroovyScript('''
+                    def project = MANUAL_PROJECT
+                    def repoBase = 'http://git@192.168.1.194:8089/a'
+                    def repoUrl = "${repoBase}/${project}"
+                    try {
+                        if (!project) {
+                            return ["N/A"]
+                        }
+                        def command = ["git", "ls-remote", "-h", repoUrl]
+                        def proc = command.execute()
+                        proc.waitFor()
+                        if (proc.exitValue() == 0) {
+                            def branches = proc.in.text.readLines().collect {
+                                it.split()[1].replaceAll('refs/heads/', '')
+                            }.sort()
+                            return branches
+                        }
+                        return ["N/A"]
+                    } catch (Exception e) {
+                        return ["N/A"]
+                    }
+                ''', true),
+                new org.jenkinsci.plugins.scriptsecurity.sandbox.groovy.SecureGroovyScript("return ['N/A']", true)
+            )
+        )
+        string(
+            name: 'MANUAL_BRANCH',defaultValue:'',description: 'Gerrit自动触发传入的分支（手动触发不使用）'
+        )
+        string(
+            name: 'PARAM_PLATFORM',defaultValue:'all',description: '手动触发时输入编译平台（Gerrit触发自动识别）'
+        )
+        choice(
+            name: 'IS_NOT_DEBUG',
+            choices: ['Release','Debug'],
+            description: '是否为调试包'
+        )
+        string(
+            name: 'MANUAL_EMAIL',
+            defaultValue: '',
+            description: '手动触发时的额外通知邮箱（可选，多个邮箱用逗号分隔）'
+        )
+        string(
+            name: 'DEFAULT_EMAIL_RECIPIENTS',
+            defaultValue: 'yixiang.huang@lango-tech.cn',
+            description: '默认邮件接收者，无论编译上传是否成功或配置文件是否合适，都会发送通知'
+        )
+        string(
+            name: 'PARAM_DEBUG_MODE',
+            defaultValue: '',
+            description: '调试模式：留空正常，timer强制定时触发，gerrit强制Gerrit触发'
+        )
+        booleanParam(
+            name: 'ENABLE_NOTIFICATION',
+            defaultValue: true,
+            description: '是否启用邮件和企业微信通知'
+        )
+        booleanParam(
+            name: 'UPLOAD_TO_SVN',
+            defaultValue: true,
+            description: '是否上传编译产物到 SVN'
+        )
+        booleanParam(
+            name: 'UPDATE_CUSTOMER_REPO',
+            defaultValue: true,
+            description: '是否更新 Customer 仓库相关信息文件'
+        )
+        string(
+            name: 'GIT_REPOSITORY_SERVER',
+            defaultValue: '',
+            description: '固件仓库服务器地址（可选）。例如: 192.168.1.182:8080。当三个 GIT_REPOSITORY_* 参数都有值时，将忽略 apkInfo.json 中的 repositoryList'
+        )
+        string(
+            name: 'GIT_REPOSITORY_PATH',
+            defaultValue: '',
+            description: '固件仓库路径（可选）。例如: rk3576_U/platform/Customer'
+        )
+        string(
+            name: 'GIT_REPOSITORY_BRANCH',
+            defaultValue: '',
+            description: '固件仓库分支（可选）。例如: develop-1.0.0-EDLA'
+        )
+    }
+    environment {
+        // 基础路径配置
+        GRADLE_BASE_DIR = '/opt/gradle'
+        JAVA_BASE_DIR = '/usr/lib/jvm'
+        CODE_REPO_BASE = 'http://git@192.168.1.194:8089/a'
+        SVN_BASE_URL = 'http://192.168.1.182:8088/scm/svn/ReleaseApk/xbh3'
+        
+        // 固定工具配置
+        SONAR_SCRIPT = '/opt/sonar-scanner-7.2.0.5079-linux-x64/bin/sonar-scanner'
+        SONAR_JAVA_HOME = '/usr/lib/jvm/java-17-openjdk-amd64'
+        
+        // 默认版本（后备方案）
+        DEFAULT_GRADLE_VERSION = '7.5'
+        DEFAULT_JAVA_VERSION = '11'
+        
+        // 通知配置
+        WECHAT_WEBHOOK = 'http://192.168.1.9:8283/auditServer/commServer/message/sendMessageByQywxHook'
+        WECHAT_HOOKKEY = 'apkBuildHook'
+    }
+
+    stages {
+        stage('Initialize Build') {
+            steps {
+                script {
+                    initializeBuildContext()
+                    setupProjectInfo()
+                    
+                    // 调试模式处理
+                    if (params.PARAM_DEBUG_MODE == 'timer') {
+                        env.isUserIdCause = 'false'
+                        env.isTimerTriggerCause = 'true'
+                        env.isGerritTriggerCause = 'false'
+                        echo '强制设置为定时触发模式'
+                    } else if (params.PARAM_DEBUG_MODE == 'gerrit') {
+                        env.isUserIdCause = 'false'
+                        env.isTimerTriggerCause = 'false'
+                        env.isGerritTriggerCause = 'true'
+                        echo '强制设置为Gerrit触发模式'
+                    }
+                    
+                    // 打印触发类型信息
+                    echo "触发类型检查:"
+                    echo "isUserIdCause = ${env.isUserIdCause}"
+                    echo "isTimerTriggerCause = ${env.isTimerTriggerCause}"
+                    echo "isGerritTriggerCause = ${env.isGerritTriggerCause}"
+                }
+            }
+        }
+        
+        stage('Checkout Source Code') {
+            steps {
+                script {
+                    checkout scmGit(
+                        branches: [[name: "*/${env.ACTUAL_BRANCH}"]], 
+                        extensions: [], 
+                        userRemoteConfigs: [[url: env.ACTUAL_CODE_REPO]]
+                    )
+                }
+            }
+        }
+        stage('Checkout Patchset') {
+            when {
+                allOf {
+                    environment name: 'isGerritTriggerCause', value: 'true'
+                    expression { env.GERRIT_REFSPEC != null && env.GERRIT_REFSPEC != '' }
+                }
+            }
+            steps {
+                sh "git fetch origin ${GERRIT_REFSPEC} && git reset --hard FETCH_HEAD"
+            }
+        }
+        stage('Load Build Configuration') {
+            steps {
+                script {
+                    try {
+                        loadBuildConfig()
+                        setupBuildEnvironment()
+                        validateBuildEnvironment()
+                        printBuildEnvironment()
+                    } catch (Exception e) {
+                        // 发送配置失败通知
+                        sendConfigFailureNotification(e.getMessage())
+                        error("配置加载失败: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+        
+        stage('Check Compile Flag') {
+            steps {
+                script {
+                    checkCompileFlag()
+                }
+            }
+        }
+        
+    //   stage('Scan Source Code') {
+    //          steps {
+    //              script {
+    //                  def scanSources = "."
+                     
+    //                  // 根据扫描模式决定扫描范围
+    //                  if (params.SCAN_MODE == 'gerrit_changes_only' && env.isGerritTriggerCause == 'true') {
+    //                      // 仅扫描 Gerrit 提交的变更文件
+    //                      echo "扫描模式: 仅扫描 Gerrit 变更文件"
+    //                      def changedFiles = sh(
+    //                          script: '''git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '\\.(java|kt|xml)$' | tr '\\n' ',' | sed 's/,$//' ''',
+    //                          returnStdout: true
+    //                      ).trim()
+                         
+    //                      if (changedFiles) {
+    //                          scanSources = changedFiles
+    //                          echo "变更文件列表: ${scanSources}"
+    //                      } else {
+    //                          echo "未检测到变更文件，将扫描全部代码"
+    //                      }
+    //                  } else {
+    //                      echo "扫描模式: 扫描全部代码"
+    //                  }
+                     
+    //                 withCredentials([string(credentialsId: '18a27e81-104f-40dd-aa09-7082be6f7d5a', variable: 'TOKEN')]) {
+    //                     docker.image('sonar-scanner:v1').inside("-v ${WORKSPACE}:/workspace -w /workspace -e SONAR_USER_HOME=/tmp/.sonar") {
+    //                         sh """
+    //                       if [ -d "${env.SONAR_JAVA_HOME}" ]; then
+    //                          export JAVA_HOME=${env.SONAR_JAVA_HOME}
+    //                       fi
+    //                       export LANG=en_US.UTF-8
+    //                       export LC_ALL=en_US.UTF-8
+    //                       export SONAR_SCANNER_OPTS="-Dfile.encoding=UTF-8"
+    //                       sonar-scanner \
+    //                           -Dsonar.host.url=http://192.168.1.116:9000 \
+    //                           -Dsonar.projectKey=${env.PROJECT_NAME} \
+    //                           -Dsonar.sourceEncoding=UTF-8 \
+    //                           -Dsonar.sources=${scanSources} \
+    //                           -Dsonar.java.binaries=${WORKSPACE} \
+    //                           -Dsonar.token=sqa_55cd4822dbc55d66b336e4189bedad8d4de09135 \
+    //                           -Dsonar.exclusions=**/*.xml,**/*.puml,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.webp,**/*.bmp,**/*.md,document/** \
+    //                           -Dsonar.scm.disabled=true
+    //                         """
+    //                     }
+    //                 }
+    //              }
+    //          }
+    //      }
+        
+        stage('Compile Firmware') {
+            when {
+                expression { env.SHOULD_COMPILE == 'true' }
+            }
+            steps {
+                script {
+                    def flavor = env.isGerritTriggerCause == 'true' ? 'all' : params.PARAM_PLATFORM
+                    def buildType = params.IS_NOT_DEBUG == 'Debug' ? 'Debug' : 'Release'
+                    
+                    echo "开始编译..."
+                    echo "项目: ${env.PROJECT_NAME}"
+                    echo "分支: ${env.ACTUAL_BRANCH}"
+                    echo "平台: ${flavor}"
+                    echo "类型: ${buildType}"
+                    echo "Gradle: ${env.GRADLE_SCRIPT}"
+                    echo "Java: ${env.COMPILE_JAVA_HOME}"
+                    
+                    // 执行Gradle构建
+                    gradleBuild(flavor, buildType)
+                    
+                    // 调试：显示当前工作目录和构建产物
+                    echo "=== 构建产物列表 ==="
+                    sh "echo '当前工作目录:' && pwd"
+                    sh "find out/ -type f 2>/dev/null | sort || echo '未找到 out 目录'"
+                    echo "===================="
+                    
+                    // 记录生成的APK和mapping文件
+                    env.APK_FILES = sh(script: """
+                        find out/ -type f -name "*.apk" -exec basename {} \\;""", 
+                        returnStdout: true
+                    ).trim()
+                    
+                    env.MAPPING_FILES = sh(script: """
+                        find out/ -type f -name "mapping_*" -exec basename {} \\;""", 
+                        returnStdout: true
+                    ).trim()
+                    
+                    // 查找 apkinfo.json 文件
+                    def apkInfoFiles = sh(script: """
+                        find out/ -type f \\( -name "apkInfo_*.json" -o -name "apkinfo.*.json" \\) 2>/dev/null || echo ""
+                    """, returnStdout: true).trim()
+                    
+                    if (apkInfoFiles) {
+                        echo "找到 apkinfo.json 文件: ${apkInfoFiles}"
+                    } else {
+                        echo "警告: 未找到 apkinfo.json 文件，Customer 仓库更新功能将无法使用"
+                        echo "请确保 Android 项目的 Gradle 构建脚本配置了生成 apkinfo.json 文件"
+                    }
+                    
+                    if (!env.APK_FILES) {
+                        error "未找到APK文件，构建失败。"
+                    }
+                    
+                    echo "编译完成，生成APK文件: ${env.APK_FILES}"
+                    if (env.MAPPING_FILES) {
+                        echo "生成mapping文件: ${env.MAPPING_FILES}"
+                    }
+                }
+            }
+        }
+        
+        stage('Upload to SVN') {
+            when {
+                expression { 
+                    // 只有手动触发且编译成功且 UPLOAD_TO_SVN 为 true 时才上传
+                    // Requirements 3.3: WHEN UPLOAD_TO_SVN 设置为 false THEN THE Pipeline SHALL 完成编译但跳过 SVN 上传阶段
+                    // 3.5日改成只需要编译成功就进入上传阶段
+                    env.SHOULD_COMPILE == 'true' && params.UPLOAD_TO_SVN
+                }
+            }
+            steps {
+                script {
+                    def flavor = env.isGerritTriggerCause == 'true' ? 'all' : params.PARAM_PLATFORM
+                    
+                    // 获取 Customer 仓库配置
+                    def buildConfig = [:]
+                    try {
+                        if (env.BUILD_CONFIG_JSON) {
+                            def lazyMap = new groovy.json.JsonSlurper().parseText(env.BUILD_CONFIG_JSON)
+                            buildConfig = convertToSerializableMap(lazyMap)
+                        }
+                    } catch (Exception e) {
+                        echo "解析构建配置失败: ${e.getMessage()}"
+                    }
+                    def customerReposConfig = getConfigValue(buildConfig, 'CUSTOMER_REPOSITORIES', '')
+                    def customerRepositories = parseCustomerRepositories(customerReposConfig)
+                    
+                    // 存储上传的 APK 信息，用于后续更新 apk_urls.txt
+                    env.UPLOADED_APKS_JSON = '[]'
+                    def uploadedApks = []
+                    
+                    echo "开始上传到 SVN..."
+                    echo "项目: ${env.PROJECT_NAME}"
+                    echo "分支: ${env.ACTUAL_BRANCH}"
+                    echo "平台/渠道: ${flavor}"
+                    echo "Customer 仓库数量: ${customerRepositories.size()}"
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: 'svn-cred', 
+                        usernameVariable: 'SVN_USER',
+                        passwordVariable: 'SVN_PASS'
+                    )]) {
+                        // 查找所有 APK 文件及其对应的渠道目录
+                        def apkFiles = sh(script: "find out/ -type f -name '*.apk' 2>/dev/null || true", returnStdout: true).trim()
+                        
+                        if (!apkFiles) {
+                            echo "未找到 APK 文件"
+                            env.UPLOAD_SUCCESS = 'false'
+                            env.UPLOAD_RESULT_MESSAGE = "未找到 APK 文件"
+                            return
+                        }
+                        
+                        def uploadSuccessCount = 0
+                        def skipCount = 0
+                        def failCount = 0
+                        
+                        apkFiles.split('\n').each { apkFilePath ->
+                            apkFilePath = apkFilePath.trim()
+                            if (!apkFilePath) return
+                            
+                            def apkFileName = apkFilePath.tokenize('/').last()
+                            
+                            // 优先从 apkInfo.json 中读取 flavor 作为渠道
+                            // apkInfo.json 文件格式: apkInfo_{APK文件名去掉.apk}.json
+                            def apkInfoJsonPath = findApkInfoJsonFile(apkFilePath, apkFileName)
+                            def channel = null
+                            def apkInfoData = null
+                            
+                            if (apkInfoJsonPath) {
+                                echo "找到 apkInfo.json: ${apkInfoJsonPath}"
+                                apkInfoData = parseApkInfoJson(apkInfoJsonPath)
+                                if (apkInfoData && apkInfoData.flavor) {
+                                    channel = apkInfoData.flavor
+                                    echo "从 apkInfo.json 读取 flavor: ${channel}"
+                                }
+                            }
+                            
+                            // 如果无法从 apkInfo.json 获取 flavor，则回退到从文件名提取
+                            if (!channel) {
+                                channel = extractChannelFromApk(apkFilePath, apkFileName)
+                                echo "从文件名提取渠道: ${channel}"
+                            }
+                            
+                            echo "=============================="
+                            echo "处理 APK: ${apkFileName}"
+                            echo "渠道: ${channel}"
+                            
+                            // Requirements 6.2: 按 xbh3/仓库名/分支/渠道/ 结构组织文件
+                            def svnChannelPath = generateSvnPath(env.PROJECT_NAME, env.ACTUAL_BRANCH, channel)
+                            def svnChannelUrl = "${env.SVN_BASE_URL}/${env.PROJECT_NAME}/${env.ACTUAL_BRANCH}/${channel}"
+                            
+                            echo "SVN 渠道目录: ${svnChannelUrl}"
+                            
+                            // 确保 SVN 渠道目录存在
+                            def mkdirResult = sh(script: """
+                                if ! svn ls "${svnChannelUrl}" --username "\$SVN_USER" --password "\$SVN_PASS" --no-auth-cache --non-interactive >/dev/null 2>&1; then
+                                    echo "创建 SVN 目录: ${svnChannelUrl}"
+                                    svn mkdir --parents "${svnChannelUrl}" -m "创建渠道目录: ${env.PROJECT_NAME}/${env.ACTUAL_BRANCH}/${channel}" --username "\$SVN_USER" --password "\$SVN_PASS" --no-auth-cache --non-interactive
+                                fi
+                            """, returnStatus: true)
+                            
+                            // 上传 APK 文件
+                            def apkRemoteUrl = "${svnChannelUrl}/${apkFileName}"
+                            def uploadSuccess = uploadFileToSvn(apkFilePath, apkRemoteUrl, "APK")
+                            
+                            if (uploadSuccess) {
+                                uploadSuccessCount++
+                                
+                                // 生成 APK 下载链接
+                                def downloadUrl = generateApkDownloadUrl(env.PROJECT_NAME, env.ACTUAL_BRANCH, channel, apkFileName)
+                                
+                                // 记录上传的 APK 信息
+                                uploadedApks.add([
+                                    projectName: env.PROJECT_NAME,
+                                    branch: env.ACTUAL_BRANCH,
+                                    channel: channel,
+                                    apkFileName: apkFileName,
+                                    downloadUrl: downloadUrl
+                                ])
+                                
+                                // 生成并上传 apk_urls.txt 到 SVN 根目录（xbh3/apk_urls.txt）
+                                // 控制方式与之前相同（UPDATE_CUSTOMER_REPO 参数控制）
+                                if (params.UPDATE_CUSTOMER_REPO) {
+                                    echo "生成 apk_urls.txt 文件..."
+                                    def apkUrlTxtLocalPath = "${env.WORKSPACE}/temp_apk_urls_${channel}_${apkFileName.replace('.apk', '')}.txt"
+                                    
+                                    // apk_urls.txt 放在 SVN 根目录下（xbh3/apk_urls.txt）
+                                    def apkUrlTxtRemoteUrl = "${env.SVN_BASE_URL}/apk_urls.txt"
+                                    def existingContent = ''
+                                    try {
+                                        def checkResult = sh(
+                                            script: """
+                                                svn ls "${apkUrlTxtRemoteUrl}" \\
+                                                    --username "\$SVN_USER" \\
+                                                    --password "\$SVN_PASS" \\
+                                                    --no-auth-cache \\
+                                                    --non-interactive 2>/dev/null
+                                            """,
+                                            returnStatus: true
+                                        )
+                                        if (checkResult == 0) {
+                                            existingContent = sh(
+                                                script: """
+                                                    svn cat "${apkUrlTxtRemoteUrl}" \\
+                                                        --username "\$SVN_USER" \\
+                                                        --password "\$SVN_PASS" \\
+                                                        --no-auth-cache \\
+                                                        --non-interactive 2>/dev/null || echo ""
+                                                """,
+                                                returnStdout: true
+                                            ).trim()
+                                        }
+                                    } catch (Exception e) {
+                                        echo "读取现有 apk_urls.txt 时出错: ${e.getMessage()}"
+                                    }
+                                    
+                                    // 追加新的 APK URL
+                                    def updatedContent = appendApkUrl(existingContent, downloadUrl)
+                                    writeFile file: apkUrlTxtLocalPath, text: updatedContent
+                                    
+                                    // 上传 apk_urls.txt 到 SVN，强制覆盖已有文件
+                                    def previousForceUpload = env.FORCE_UPLOAD
+                                    env.FORCE_UPLOAD = 'true'
+                                    uploadFileToSvn(apkUrlTxtLocalPath, apkUrlTxtRemoteUrl, "apk_urls.txt")
+                                    if (previousForceUpload != null) {
+                                        env.FORCE_UPLOAD = previousForceUpload
+                                    } else {
+                                        env.FORCE_UPLOAD = 'false'
+                                    }
+                                    
+                                    // 清理临时文件
+                                    sh "rm -f '${apkUrlTxtLocalPath}'"
+                                }
+                                
+                                // Requirements 4.3: 上传编译产物中的 apkinfo.json 文件（如存在）
+                                // apkInfoJsonPath 已在前面获取 flavor 时查找过
+                                if (apkInfoJsonPath) {
+                                    def apkInfoJsonFileName = apkInfoJsonPath.tokenize('/').last()
+                                    def apkInfoJsonRemoteUrl = "${svnChannelUrl}/${apkInfoJsonFileName}"
+                                    uploadFileToSvn(apkInfoJsonPath, apkInfoJsonRemoteUrl, "apkinfo.json")
+                                    
+                                    // 存储 apkinfo.json 路径供后续阶段使用
+                                    uploadedApks[-1].apkInfoJsonPath = apkInfoJsonPath
+                                }
+                                
+                                // Requirements 4.1, 4.3, 3.4: 生成并上传 repository_list.info 文件
+                                if (params.UPDATE_CUSTOMER_REPO && customerRepositories.size() > 0) {
+                                    echo "生成 repository_list.info 文件..."
+                                    def repoListContent = generateRepositoryListInfo(customerRepositories)
+                                    def repoListLocalPath = "${env.WORKSPACE}/temp_repository_list_${channel}.info"
+                                    writeFile file: repoListLocalPath, text: repoListContent
+                                    
+                                    def repoListRemoteUrl = "${svnChannelUrl}/repository_list.info"
+                                    uploadFileToSvn(repoListLocalPath, repoListRemoteUrl, "repository_list.info")
+                                    
+                                    // 清理临时文件
+                                    sh "rm -f '${repoListLocalPath}'"
+                                }
+                            } else {
+                                failCount++
+                            }
+                            
+                            // 上传 mapping 文件（如存在）
+                            def mappingFiles = sh(script: "find out/ -type f -name 'mapping_*${channel}*' 2>/dev/null || true", returnStdout: true).trim()
+                            if (mappingFiles) {
+                                mappingFiles.split('\n').each { mappingPath ->
+                                    mappingPath = mappingPath.trim()
+                                    if (mappingPath) {
+                                        def mappingFileName = mappingPath.tokenize('/').last()
+                                        def mappingRemoteUrl = "${svnChannelUrl}/${mappingFileName}"
+                                        uploadFileToSvn(mappingPath, mappingRemoteUrl, "mapping")
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 存储上传的 APK 信息供后续阶段使用
+                        env.UPLOADED_APKS_JSON = groovy.json.JsonOutput.toJson(uploadedApks)
+                        
+                        echo "=== 上传结果统计 ==="
+                        echo "成功上传: ${uploadSuccessCount} 个 APK"
+                        echo "跳过已存在: ${skipCount} 个文件"
+                        echo "上传失败: ${failCount} 个文件"
+                        
+                        if (failCount == 0) {
+                            env.UPLOAD_SUCCESS = 'true'
+                            if (uploadSuccessCount > 0) {
+                                env.UPLOAD_RESULT_MESSAGE = "成功上传 ${uploadSuccessCount} 个 APK 到新目录结构"
+                            } else {
+                                env.UPLOAD_RESULT_MESSAGE = "所有文件在 SVN 中已存在，未上传新文件"
+                            }
+                        } else {
+                            env.UPLOAD_SUCCESS = 'false'
+                            env.UPLOAD_RESULT_MESSAGE = "文件上传过程中出现 ${failCount} 个错误"
+                            error env.UPLOAD_RESULT_MESSAGE
+                        }
+                    }
+                }
+            }
+        }
+        
+        // [已禁用] 推送到 Customer Git 仓库的功能已注释，apk_urls.txt 仅上传到 SVN
+        // Requirements 6.1: 生成或更新对应的 apk_urls.txt 文件
+        // 从 apkinfo.json 的 repositoryList 中读取关联的 Customer 仓库信息，或使用构建参数指定
+        // stage('Update APK URLs') {
+        //     when {
+        //         expression {
+        //             // Requirements 6.1: WHEN APK 上传到 SVN 完成后且 UPDATE_CUSTOMER_REPO 为 true
+        //             // THEN THE Pipeline SHALL 从 apkinfo.json 的 repositoryList 中读取关联的 Customer 仓库信息
+        //             env.SHOULD_COMPILE == 'true' && 
+        //             env.isGerritTriggerCause != 'true' && 
+        //             params.UPLOAD_TO_SVN && 
+        //             params.UPDATE_CUSTOMER_REPO
+        //         }
+        //     }
+        //     steps {
+        //         script {
+        //             // 检查是否有构建参数指定 Customer 仓库（三个参数都有值才生效）
+        //             def paramServer = params.GIT_REPOSITORY_SERVER?.trim()
+        //             def paramPath = params.GIT_REPOSITORY_PATH?.trim()
+        //             def paramBranch = params.GIT_REPOSITORY_BRANCH?.trim()
+        //             def useParamRepo = paramServer && paramPath && paramBranch
+        //             
+        //             if (useParamRepo) {
+        //                 echo "使用构建参数指定的 Customer 仓库:"
+        //                 echo "  服务器: ${paramServer}"
+        //                 echo "  仓库路径: ${paramPath}"
+        //                 echo "  分支: ${paramBranch}"
+        //                 echo "（将忽略 apkInfo.json 中的 repositoryList）"
+        //             } else {
+        //                 echo "开始更新 APK URLs 文件（从 apkinfo.json 读取 repositoryList）..."
+        //             }
+        //             
+        //             // 获取上传的 APK 信息
+        //             def uploadedApks = []
+        //             try {
+        //                 if (env.UPLOADED_APKS_JSON) {
+        //                     def lazyList = new groovy.json.JsonSlurper().parseText(env.UPLOADED_APKS_JSON)
+        //                     uploadedApks = convertToSerializableMap(lazyList)
+        //                 }
+        //             } catch (Exception e) {
+        //                 echo "解析上传 APK 信息失败: ${e.getMessage()}"
+        //             }
+        //             
+        //             if (uploadedApks.isEmpty()) {
+        //                 echo "没有上传的 APK 信息，跳过 apk_urls.txt 更新"
+        //                 env.APK_URLS_UPDATE_STATUS = '没有上传的 APK'
+        //                 return
+        //             }
+        //             
+        //             echo "上传的 APK 数量: ${uploadedApks.size()}"
+        //             
+        //             def updateSuccessCount = 0
+        //             def updateFailCount = 0
+        //             def totalRepoCount = 0
+        //             
+        //             // 如果有构建参数，构建仓库列表，所有 APK 共用
+        //             def paramParsedRepos = null
+        //             if (useParamRepo) {
+        //                 paramParsedRepos = [[
+        //                     server: paramServer,
+        //                     repositoryPath: paramPath,
+        //                     branch: paramBranch
+        //                 ]]
+        //                 echo "从构建参数构建 1 个 Customer 仓库配置"
+        //             }
+        //             
+        //             // Requirements 6.1, 6.2: 遍历每个上传的 APK
+        //             uploadedApks.each { apkInfo ->
+        //                 echo "=============================="
+        //                 echo "处理 APK: ${apkInfo.apkFileName}"
+        //                 
+        //                 def customerRepositories = []
+        //                 // 优先使用构建参数指定的仓库列表
+        //                 if (paramParsedRepos != null && !paramParsedRepos.isEmpty()) {
+        //                     customerRepositories = paramParsedRepos
+        //                     echo "使用构建参数指定的 ${customerRepositories.size()} 个 Customer 仓库"
+        //                 } else {
+        //                     // 从 apkinfo.json 读取 repositoryList
+        //                     // 查找对应的 apkinfo.json 文件
+        //                     def apkInfoJsonPath = apkInfo.apkInfoJsonPath
+        //                     if (!apkInfoJsonPath) {
+        //                         // 如果没有存储路径，尝试通过搜索查找
+        //                         // 使用 find 命令在整个 out 目录下搜索 apkinfo.json 文件
+        //                         def apkBaseName = apkInfo.apkFileName.replace('.apk', '')
+        //                         def searchResult = sh(
+        //                             script: "find out/ -name 'apkInfo_${apkBaseName}.json' 2>/dev/null | head -1",
+        //                             returnStdout: true
+        //                         ).trim()
+        //                         
+        //                         if (searchResult) {
+        //                             apkInfoJsonPath = searchResult
+        //                             echo "通过搜索找到 apkinfo.json: ${apkInfoJsonPath}"
+        //                         } else {
+        //                             echo "未找到 apkinfo.json 文件: apkInfo_${apkBaseName}.json"
+        //                         }
+        //                     } else {
+        //                         echo "使用已存储的 apkinfo.json 路径: ${apkInfoJsonPath}"
+        //                     }
+        //                     
+        //                     // 解析 apkinfo.json 获取 repositoryList
+        //                     def parsedApkInfo = parseApkInfoJson(apkInfoJsonPath)
+        //                     if (!parsedApkInfo) {
+        //                         echo "无法解析 apkinfo.json，跳过此 APK 的 Customer 仓库更新"
+        //                         return // continue to next APK
+        //                     }
+        //                     
+        //                     // Requirements 6.1: 从 repositoryList 获取 Customer 仓库信息
+        //                     customerRepositories = getRepositoryListFromApkInfo(parsedApkInfo)
+        //                     if (customerRepositories.isEmpty()) {
+        //                         echo "apkinfo.json 中没有 repositoryList，跳过此 APK 的 Customer 仓库更新"
+        //                         return // continue to next APK
+        //                     }
+        //                     
+        //                     echo "从 apkinfo.json 读取到 ${customerRepositories.size()} 个 Customer 仓库"
+        //                 }
+        //                 totalRepoCount += customerRepositories.size()
+        //                 
+        //                 // Requirements 6.2, 6.3, 6.4, 6.5: 为每个 Customer 仓库更新 apk_urls.txt
+        //                 customerRepositories.each { customerRepo ->
+        //                     echo "------------------------------"
+        //                     echo "处理 Customer 仓库: ${customerRepo.repositoryPath}"
+        //                     echo "服务器: ${customerRepo.server}"
+        //                     echo "分支: ${customerRepo.branch}"
+        //                     
+        //                     // Requirements 6.3: 使用命名格式 Customer仓库名_分支名_apk_urls.txt
+        //                     def apkUrlsFileName = generateApkUrlsFileName(customerRepo.repositoryPath, customerRepo.branch)
+        //                     echo "apk_urls.txt 文件名: ${apkUrlsFileName}"
+        //                     
+        //                     // Requirements 6.5: 追加新的 APK 下载链接
+        //                     def downloadUrl = apkInfo.downloadUrl
+        //                     echo "追加 APK URL: ${downloadUrl}"
+        //                     
+        //                     // 更新 apk_urls.txt 并推送到 SVN 和 Git 仓库
+        //                     def success = updateApkUrlsFile(
+        //                         customerRepo.repositoryPath, 
+        //                         customerRepo.branch, 
+        //                         downloadUrl,
+        //                         customerRepo.server  // 传入 Git 服务器地址
+        //                     )
+        //                     if (success) {
+        //                         updateSuccessCount++
+        //                     } else {
+        //                         updateFailCount++
+        //                     }
+        //                 }
+        //             }
+        //             
+        //             echo "=== APK URLs 更新结果统计 ==="
+        //             echo "处理的 APK 数量: ${uploadedApks.size()}"
+        //             echo "关联的 Customer 仓库总数: ${totalRepoCount}"
+        //             echo "成功更新: ${updateSuccessCount} 次"
+        //             echo "更新失败: ${updateFailCount} 次"
+        //             
+        //             // 存储 Customer 仓库数量供通知使用
+        //             env.CUSTOMER_REPO_COUNT = totalRepoCount.toString()
+        //             
+        //             if (totalRepoCount == 0) {
+        //                 env.APK_URLS_UPDATE_STATUS = "未找到关联的 Customer 仓库（apkinfo.json 中无 repositoryList）"
+        //             } else if (updateFailCount == 0) {
+        //                 env.APK_URLS_UPDATE_STATUS = "成功更新 ${updateSuccessCount} 个 APK URL（${totalRepoCount} 个仓库）"
+        //             } else {
+        //                 env.APK_URLS_UPDATE_STATUS = "更新过程中出现 ${updateFailCount} 个错误"
+        //                 // 不中断构建，仅记录警告
+        //                 echo "警告: APK URLs 更新过程中出现错误，但不影响主流程"
+        //             }
+        //         }
+        //     }
+        // }
+    }
+    
+    post {
+        success {
+            script {
+                if (env.SHOULD_COMPILE == 'true' && params.ENABLE_NOTIFICATION) {
+                    // 根据触发方式发送不同的通知
+                    if (env.isGerritTriggerCause == 'true') {
+                        sendAutoTriggerSuccessNotification()
+                    } else {
+                        sendSuccessNotification()
+                    }
+                } else if (env.SHOULD_COMPILE == 'false') {
+                    echo "编译标志设置为false，构建成功完成但跳过编译和通知"
+                } else {
+                    echo "通知功能已禁用，跳过成功通知"
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.SHOULD_COMPILE == 'true' && params.ENABLE_NOTIFICATION) {
+                    sendFailureNotification()
+                } else if (env.SHOULD_COMPILE == 'false') {
+                    echo "编译标志设置为false，构建失败但跳过通知"
+                } else {
+                    echo "通知功能已禁用，跳过失败通知"
+                }
+            }
+        }
+        aborted {
+            script {
+                echo "构建被中止"
+            }
+        }
+    }
+}
+
+// ========== 新增的编译标志检查方法 ==========
+
+// 检查编译标志
+def checkCompileFlag() {
+    def buildConfig = [:]
+    try {
+        if (env.BUILD_CONFIG_JSON) {
+            def lazyMap = new groovy.json.JsonSlurper().parseText(env.BUILD_CONFIG_JSON)
+            buildConfig = convertToSerializableMap(lazyMap)
+        }
+    } catch (Exception e) {
+        echo "解析构建配置失败: ${e.getMessage()}"
+        buildConfig = getDefaultBuildConfig()
+    }
+    
+    // 获取编译标志，默认为true以保持向后兼容
+    def compileFlag = getConfigValue(buildConfig, 'COMPILE_TEST', 'true').toBoolean()
+    env.SHOULD_COMPILE = compileFlag.toString()
+    
+    // 获取强制覆盖上传标志，默认为false
+    def forceUpload = getConfigValue(buildConfig, 'FORCE_UPLOAD', 'true').toBoolean()
+    env.FORCE_UPLOAD = forceUpload.toString()
+    
+    // 获取责任人列表
+    def responsiblePersons = getConfigValue(buildConfig, 'RESPONSIBLE_PERSONS', '')
+    env.RESPONSIBLE_PERSONS = responsiblePersons
+    
+    // 获取触发控制配置
+    def gerritTriggerEnabled = getConfigValue(buildConfig, 'GERRIT_TRIGGER_ENABLED', 'true').toBoolean()
+    def timerTriggerEnabled = getConfigValue(buildConfig, 'TIMER_TRIGGER_ENABLED', 'true').toBoolean()
+    
+    echo "编译配置检查:"
+    echo "- 是否编译: ${env.SHOULD_COMPILE}"
+    echo "- 强制覆盖上传: ${env.FORCE_UPLOAD}"
+    echo "- 责任人: ${env.RESPONSIBLE_PERSONS}"
+    echo "- Gerrit触发启用: ${gerritTriggerEnabled}"
+    echo "- 定时触发启用: ${timerTriggerEnabled}"
+    
+    // 检查触发控制逻辑
+    // Requirements 1.1, 1.2, 1.3: Gerrit 触发控制
+    if (env.isGerritTriggerCause == 'true' && !gerritTriggerEnabled) {
+        echo "Gerrit触发已禁用 (GERRIT_TRIGGER_ENABLED=false)，跳过编译"
+        env.SHOULD_COMPILE = 'false'
+        env.SKIP_REASON = 'Gerrit触发已禁用'
+        currentBuild.result = 'SUCCESS'
+        echo "依据配置：Gerrit触发已禁用，不进行编译。构建流程正常结束。"
+        return
+    }
+    
+    // Requirements 2.1, 2.2: 定时触发控制
+    if (env.isTimerTriggerCause == 'true' && !timerTriggerEnabled) {
+        echo "定时触发已禁用 (TIMER_TRIGGER_ENABLED=false)，跳过编译"
+        env.SHOULD_COMPILE = 'false'
+        env.SKIP_REASON = '定时触发已禁用'
+        currentBuild.result = 'SUCCESS'
+        echo "依据配置：定时触发已禁用，不进行编译。构建流程正常结束。"
+        return
+    }
+    
+    if (!compileFlag) {
+        echo "编译标志设置为false，跳过后续编译阶段"
+        currentBuild.result = 'SUCCESS'
+        echo "依据参数设置：编译为false，不进行编译。构建流程正常结束。"
+    }
+}
+
+/**
+ * 检查是否应该跳过编译基于触发类型和配置
+ * 
+ * @param isGerritTrigger 是否为 Gerrit 触发
+ * @param isTimerTrigger 是否为定时触发
+ * @param gerritTriggerEnabled Gerrit 触发是否启用
+ * @param timerTriggerEnabled 定时触发是否启用
+ * @return Map 包含 shouldSkip (boolean) 和 reason (String)
+ */
+def checkTriggerControl(boolean isGerritTrigger, boolean isTimerTrigger, 
+                        boolean gerritTriggerEnabled, boolean timerTriggerEnabled) {
+    // Requirements 1.1, 1.2: Gerrit 触发控制
+    if (isGerritTrigger && !gerritTriggerEnabled) {
+        return [shouldSkip: true, reason: 'Gerrit触发已禁用']
+    }
+    
+    // Requirements 2.1, 2.2: 定时触发控制
+    if (isTimerTrigger && !timerTriggerEnabled) {
+        return [shouldSkip: true, reason: '定时触发已禁用']
+    }
+    
+    return [shouldSkip: false, reason: '']
+}
+
+// ========== 修复的配置管理方法 ==========
+
+// 加载构建配置
+def loadBuildConfig() {
+    def configFile = '.auto_build_config'
+    
+    // 确保 BUILD_CONFIG 是一个 Map
+    if (env.BUILD_CONFIG == null) {
+        env.BUILD_CONFIG = "{}" // 初始化为空的 JSON 字符串
+    }
+    
+    // 解析为 Map 对象
+    def buildConfigMap = [:]
+    
+    if (fileExists(configFile)) {
+        echo "找到项目构建配置文件: ${configFile}"
+        
+        try {
+            def configContent = readFile(configFile)
+            buildConfigMap = parseConfigContent(configContent)
+            
+            echo "成功加载 ${buildConfigMap.size()} 个配置项"
+            
+        } catch (Exception e) {
+            echo "读取配置文件失败: ${e.getMessage()}"
+            throw new Exception("配置文件 .auto_build_config 存在但解析失败: ${e.getMessage()}")
+        }
+    } else {
+        echo "未找到项目构建配置文件: ${configFile}"
+        throw new Exception("配置文件 .auto_build_config 不存在，请检查项目配置。")
+    }
+    
+    // 应用默认值：确保新配置参数有默认值以保持向后兼容
+    def defaults = getDefaultBuildConfig()
+    
+    // GERRIT_TRIGGER_ENABLED: 默认 true
+    if (!buildConfigMap.containsKey('GERRIT_TRIGGER_ENABLED')) {
+        buildConfigMap['GERRIT_TRIGGER_ENABLED'] = defaults['GERRIT_TRIGGER_ENABLED']
+        echo "使用默认值: GERRIT_TRIGGER_ENABLED = ${buildConfigMap['GERRIT_TRIGGER_ENABLED']}"
+    }
+    
+    // TIMER_TRIGGER_ENABLED: 默认 true
+    if (!buildConfigMap.containsKey('TIMER_TRIGGER_ENABLED')) {
+        buildConfigMap['TIMER_TRIGGER_ENABLED'] = defaults['TIMER_TRIGGER_ENABLED']
+        echo "使用默认值: TIMER_TRIGGER_ENABLED = ${buildConfigMap['TIMER_TRIGGER_ENABLED']}"
+    }
+    
+    // CUSTOMER_REPOSITORIES: 默认空字符串
+    if (!buildConfigMap.containsKey('CUSTOMER_REPOSITORIES')) {
+        buildConfigMap['CUSTOMER_REPOSITORIES'] = defaults['CUSTOMER_REPOSITORIES']
+        echo "使用默认值: CUSTOMER_REPOSITORIES = ${buildConfigMap['CUSTOMER_REPOSITORIES']}"
+    }
+    
+    // 将配置存储为环境变量（序列化为JSON字符串）
+    env.BUILD_CONFIG_JSON = groovy.json.JsonOutput.toJson(buildConfigMap)
+    return buildConfigMap
+}
+
+// 获取默认构建配置
+def getDefaultBuildConfig() {
+    return [
+        'JAVA_VERSION': env.DEFAULT_JAVA_VERSION ?: '11',
+        'GRADLE_VERSION': env.DEFAULT_GRADLE_VERSION ?: '7.5',
+        'COMPILE_TEST': 'true', // 默认允许编译
+        'FORCE_UPLOAD': 'false', // 默认不强制覆盖
+        'RESPONSIBLE_PERSONS': '', // 默认无额外责任人
+        'GERRIT_TRIGGER_ENABLED': 'true', // 默认响应 Gerrit 触发
+        'TIMER_TRIGGER_ENABLED': 'true', // 默认响应定时触发
+        'CUSTOMER_REPOSITORIES': '' // 默认无关联 Customer 仓库
+    ]
+}
+
+/**
+ * 解析配置文件内容，支持多行格式
+ * 
+ * 支持两种格式：
+ * 1. 单行格式：KEY=value1,value2,value3
+ * 2. 多行格式：
+ *    KEY=
+ *        value1
+ *        value2
+ *        # 注释行会被忽略
+ *        value3
+ * 
+ * @param configContent 配置文件内容字符串
+ * @return 解析后的配置 Map
+ * 
+ * Requirements: 9.1, 9.2, 9.3
+ */
+def parseConfigContent(String configContent) {
+    def buildConfigMap = [:]
+    def configLines = configContent.split('\n')
+    
+    def currentKey = null
+    def currentValue = new StringBuilder()
+    def isMultiLine = false
+    
+    configLines.each { line ->
+        def rawLine = line
+        def trimmedLine = line.trim()
+        
+        // 检查是否是续行（以空格或制表符开头，且当前有活动的多行配置）
+        if (isMultiLine && currentKey && (rawLine.startsWith(' ') || rawLine.startsWith('\t'))) {
+            // 忽略空行和注释行
+            if (trimmedLine && !trimmedLine.startsWith('#')) {
+                if (currentValue.length() > 0) {
+                    currentValue.append('\n')
+                }
+                currentValue.append(trimmedLine)
+            }
+            return // continue to next line
+        }
+        
+        // 如果之前有多行配置，先保存它
+        if (isMultiLine && currentKey) {
+            buildConfigMap[currentKey] = currentValue.toString()
+            echo "配置项: ${currentKey} = ${buildConfigMap[currentKey]}"
+            currentKey = null
+            currentValue = new StringBuilder()
+            isMultiLine = false
+        }
+        
+        // 跳过空行和注释行
+        if (!trimmedLine || trimmedLine.startsWith('#')) {
+            return // continue to next line
+        }
+        
+        // 解析 KEY=VALUE 格式
+        if (trimmedLine.contains('=')) {
+            def parts = trimmedLine.split('=', 2)
+            if (parts.size() == 2) {
+                def key = parts[0].trim()
+                def value = parts[1].trim().replaceAll(/^['"]|['"]$/, '')
+                
+                if (value.isEmpty()) {
+                    // 值为空，可能是多行格式的开始
+                    currentKey = key
+                    currentValue = new StringBuilder()
+                    isMultiLine = true
+                } else {
+                    // 单行格式
+                    buildConfigMap[key] = value
+                    echo "配置项: ${key} = ${value}"
+                }
+            }
+        }
+    }
+    
+    // 处理最后一个多行配置
+    if (isMultiLine && currentKey) {
+        buildConfigMap[currentKey] = currentValue.toString()
+        echo "配置项: ${currentKey} = ${buildConfigMap[currentKey]}"
+    }
+    
+    return buildConfigMap
+}
+
+// 从配置中安全获取值
+def getConfigValue(configMap, key, defaultValue = '') {
+    if (configMap && configMap instanceof Map) {
+        return configMap.get(key) ?: defaultValue
+    }
+    return defaultValue
+}
+
+// 设置构建环境
+def setupBuildEnvironment() {
+    // 加载配置
+    def buildConfig = loadBuildConfig()
+    
+    // 安全获取配置值
+    def gradleVersion = getConfigValue(buildConfig, 'GRADLE_VERSION', env.DEFAULT_GRADLE_VERSION)
+    def javaVersion = getConfigValue(buildConfig, 'JAVA_VERSION', env.DEFAULT_JAVA_VERSION)
+    
+    // 设置Gradle路径
+    env.GRADLE_SCRIPT = "${env.GRADLE_BASE_DIR}/gradle-${gradleVersion}/bin/gradle"
+    
+    // 设置Java路径
+    env.COMPILE_JAVA_HOME = "${env.JAVA_BASE_DIR}/java-${javaVersion}-openjdk-amd64"
+    
+    // 如果上述标准路径不存在，尝试其他常见路径模式
+    if (!fileExists(env.COMPILE_JAVA_HOME)) {
+        def alternativePath = "${env.JAVA_BASE_DIR}/java-1.${javaVersion}.0-openjdk-amd64"
+        if (fileExists(alternativePath)) {
+            env.COMPILE_JAVA_HOME = alternativePath
+            echo "使用备选Java路径: ${env.COMPILE_JAVA_HOME}"
+        }
+    }
+    
+    echo "构建环境设置完成:"
+    echo "- Gradle: ${env.GRADLE_SCRIPT} (版本: ${gradleVersion})"
+    echo "- Java: ${env.COMPILE_JAVA_HOME} (版本: ${javaVersion})"
+}
+
+// 验证构建环境
+def validateBuildEnvironment() {
+    echo "开始验证构建环境..."
+    
+    // 验证Gradle是否存在
+    def gradleDir = env.GRADLE_SCRIPT.replace('/bin/gradle', '')
+    if (!fileExists(gradleDir)) {
+        error "Gradle版本不存在: ${gradleDir}. 请检查配置的GRADLE_VERSION或联系管理员安装对应版本"
+    }
+    
+    // 验证Gradle可执行文件
+    if (!fileExists(env.GRADLE_SCRIPT)) {
+        error "Gradle可执行文件不存在: ${env.GRADLE_SCRIPT}"
+    }
+    
+    // 验证Java是否存在
+    if (!fileExists(env.COMPILE_JAVA_HOME)) {
+        error "Java版本不存在: ${env.COMPILE_JAVA_HOME}. 请检查配置的JAVA_VERSION或联系管理员安装对应版本"
+    }
+    
+    // 验证Java版本
+    try {
+        def javaVersionOutput = sh(script: "${env.COMPILE_JAVA_HOME}/bin/java -version 2>&1", returnStdout: true)
+        echo "Java版本信息: ${javaVersionOutput}"
+    } catch (Exception e) {
+        error "Java版本验证失败: ${e.getMessage()}"
+    }
+    
+    // 验证Gradle版本
+    try {
+        def gradleVersionOutput = sh(script: "${env.GRADLE_SCRIPT} --version", returnStdout: true)
+        echo "Gradle版本信息: ${gradleVersionOutput.split('\n')[0]}" // 只显示第一行
+    } catch (Exception e) {
+        error "Gradle版本验证失败: ${e.getMessage()}"
+    }
+    
+    echo "构建环境验证通过"
+}
+
+// 打印构建环境信息
+def printBuildEnvironment() {
+    def buildConfig = [:]
+    try {
+        if (env.BUILD_CONFIG_JSON) {
+            def lazyMap = new groovy.json.JsonSlurper().parseText(env.BUILD_CONFIG_JSON)
+            buildConfig = convertToSerializableMap(lazyMap)
+        }
+    } catch (Exception e) {
+        echo "解析构建配置失败: ${e.getMessage()}"
+        buildConfig = getDefaultBuildConfig()
+    }
+    
+    def javaVersion = getConfigValue(buildConfig, 'JAVA_VERSION', env.DEFAULT_JAVA_VERSION)
+    def gradleVersion = getConfigValue(buildConfig, 'GRADLE_VERSION', env.DEFAULT_GRADLE_VERSION)
+    def compileTest = getConfigValue(buildConfig, 'COMPILE_TEST', 'true')
+    def forceUpload = getConfigValue(buildConfig, 'FORCE_UPLOAD', 'false')
+    def responsiblePersons = getConfigValue(buildConfig, 'RESPONSIBLE_PERSONS', '')
+    
+    echo """
+    ========== 构建环境 ==========
+    项目名称: ${env.PROJECT_NAME}
+    代码仓库: ${env.ACTUAL_CODE_REPO}
+    构建分支: ${env.ACTUAL_BRANCH}
+    
+    编译配置:
+    - 是否编译: ${compileTest}
+    - 强制覆盖上传: ${forceUpload}
+    - 责任人: ${responsiblePersons}
+    
+    编译工具:
+    - Gradle: ${env.GRADLE_SCRIPT} (版本: ${gradleVersion})
+    - Java: ${env.COMPILE_JAVA_HOME} (版本: ${javaVersion})
+    
+    Sonar工具:
+    - Sonar: ${env.SONAR_SCRIPT}
+    - Sonar Java: ${env.SONAR_JAVA_HOME}
+    
+    SVN路径: ${env.SVN_BASE_URL}/${env.PROJECT_NAME}/${env.ACTUAL_BRANCH}
+    =============================
+    """
+}
+
+// ========== 原有工具方法 ==========
+
+def initializeBuildContext() {
+    def isUserIdCause = !currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause').isEmpty()
+    def isTimerTriggerCause = !currentBuild.getBuildCauses('hudson.triggers.TimerTrigger$TimerTriggerCause').isEmpty()
+    def isGerritTriggerCause = !currentBuild.getBuildCauses('com.sonyericsson.hudson.plugins.gerrit.trigger.hudsontrigger.GerritCause').isEmpty()
+    isGerritTriggerCause |= !currentBuild.getBuildCauses('com.sonyericsson.hudson.plugins.gerrit.trigger.hudsontrigger.GerritUserCause').isEmpty()
+    
+    env.isUserIdCause = isUserIdCause.toString()
+    env.isTimerTriggerCause = isTimerTriggerCause.toString()
+    env.isGerritTriggerCause = isGerritTriggerCause.toString()
+    
+    // 获取Gerrit提交人信息
+    if (env.isGerritTriggerCause == 'true') {
+        env.GERRIT_SUBMITTER_EMAIL = getGerritSubmitterEmail()
+        env.GERRIT_SUBMITTER_NAME = getGerritSubmitterName()
+        echo "Gerrit提交人: ${env.GERRIT_SUBMITTER_NAME} <${env.GERRIT_SUBMITTER_EMAIL}>"
+    }
+    
+    // 设置实际分支
+    if (env.isGerritTriggerCause == 'true') {
+        env.ACTUAL_BRANCH = getGerritBranchFromRefspec()
+    } else {
+        def manualBranch = params.MANUAL_BRANCH_SELECT
+        if (!manualBranch || manualBranch.trim().isEmpty() || manualBranch == 'N/A') {
+            error "未指定分支，请在手动触发时选择分支"
+        }
+        env.ACTUAL_BRANCH = manualBranch.trim()
+    }
+}
+
+def setupProjectInfo() {
+    if (env.isGerritTriggerCause == 'true') {
+        env.PROJECT_NAME = getGerritProjectName()
+    } else {
+        env.PROJECT_NAME = params.MANUAL_PROJECT
+    }
+    
+    env.ACTUAL_CODE_REPO = "${env.CODE_REPO_BASE}/${env.PROJECT_NAME}"
+}
+
+def getGerritProjectName() {
+    if (env.GERRIT_PROJECT) {
+        return env.GERRIT_PROJECT
+    }
+    echo "警告：无法确定Gerrit项目，使用默认项目 XbhAdverPlayer3.0"
+    return 'XbhAdverPlayer3.0'
+}
+
+def getGerritBranchFromRefspec() {
+    if (env.GERRIT_BRANCH) {
+        return env.GERRIT_BRANCH
+    }
+    if (env.GERRIT_REFSPEC) {
+        def refspec = env.GERRIT_REFSPEC
+        if (refspec.startsWith('refs/heads/')) {
+            return refspec.replace('refs/heads/', '')
+        }
+    }
+    try {
+        def branch = sh(script: 'git branch --show-current', returnStdout: true).trim()
+        if (branch) {
+            return branch
+        }
+    } catch (Exception e) {
+        echo "无法从git获取分支信息: ${e.getMessage()}"
+    }
+    error "无法获取Gerrit分支信息，请检查触发参数或Gerrit事件"
+}
+
+// 获取Gerrit提交人邮箱
+def getGerritSubmitterEmail() {
+    // 优先从commit message中提取Author邮箱
+    def authorEmail = extractAuthorEmailFromCommitMessage()
+    if (authorEmail) {
+        echo "从commit message中提取到Author邮箱: ${authorEmail}"
+        return authorEmail
+    }
+    
+    // 其次使用GERRIT_PATCHSET_UPLOADER_EMAIL（最近上传者）
+    if (env.GERRIT_PATCHSET_UPLOADER_EMAIL) {
+        return env.GERRIT_PATCHSET_UPLOADER_EMAIL
+    }
+    // 使用GERRIT_CHANGE_OWNER_EMAIL（变更所有者）
+    if (env.GERRIT_CHANGE_OWNER_EMAIL) {
+        return env.GERRIT_CHANGE_OWNER_EMAIL
+    }
+    // 兜底：尝试从其他Gerrit环境变量获取
+    if (env.GERRIT_EVENT_ACCOUNT_EMAIL) {
+        return env.GERRIT_EVENT_ACCOUNT_EMAIL
+    }
+    echo "警告：无法获取Gerrit提交人邮箱"
+    return ''
+}
+
+// 从commit message中提取Author邮箱
+def extractAuthorEmailFromCommitMessage() {
+    try {
+        // 尝试从GERRIT_CHANGE_COMMIT_MESSAGE环境变量获取
+        def commitMessage = env.GERRIT_CHANGE_COMMIT_MESSAGE ?: ''
+        
+        // 如果环境变量不存在，尝试通过git命令获取
+        if (!commitMessage || commitMessage.allWhitespace) {
+            commitMessage = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+        }
+        
+        if (commitMessage && !commitMessage.allWhitespace) {
+            // 使用正则表达式匹配 Author : name <email@domain.com> 格式
+            def matcher = commitMessage =~ /Author\s*:\s*[^<]*<([^>]+)>/
+            if (matcher.find()) {
+                def email = matcher.group(1).trim()
+                echo "成功从commit message中提取Author邮箱: ${email}"
+                return email
+            } else {
+                echo "commit message中未找到Author邮箱格式"
+            }
+        }
+    } catch (Exception e) {
+        echo "从commit message提取Author邮箱失败: ${e.getMessage()}"
+    }
+    
+    return ''
+}
+
+// 获取Gerrit提交人姓名
+def getGerritSubmitterName() {
+    // 优先从commit message中提取Author姓名
+    def authorName = extractAuthorNameFromCommitMessage()
+    if (authorName) {
+        return authorName
+    }
+    
+    // 其次使用GERRIT_PATCHSET_UPLOADER_NAME（最近上传者）
+    if (env.GERRIT_PATCHSET_UPLOADER_NAME) {
+        return env.GERRIT_PATCHSET_UPLOADER_NAME
+    }
+    // 使用GERRIT_CHANGE_OWNER_NAME（变更所有者）
+    if (env.GERRIT_CHANGE_OWNER_NAME) {
+        return env.GERRIT_CHANGE_OWNER_NAME
+    }
+    // 兜底：尝试从其他Gerrit环境变量获取
+    if (env.GERRIT_EVENT_ACCOUNT_NAME) {
+        return env.GERRIT_EVENT_ACCOUNT_NAME
+    }
+    echo "警告：无法获取Gerrit提交人姓名"
+    return '未知提交人'
+}
+
+// 从commit message中提取Author姓名
+def extractAuthorNameFromCommitMessage() {
+    try {
+        // 尝试从GERRIT_CHANGE_COMMIT_MESSAGE环境变量获取
+        def commitMessage = env.GERRIT_CHANGE_COMMIT_MESSAGE ?: ''
+        
+        // 如果环境变量不存在，尝试通过git命令获取
+        if (!commitMessage || commitMessage.allWhitespace) {
+            commitMessage = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+        }
+        
+        if (commitMessage && !commitMessage.allWhitespace) {
+            // 使用正则表达式匹配 Author : name <email@domain.com> 格式
+            def matcher = commitMessage =~ /Author\s*:\s*([^<]+?)\s*<[^>]+>/
+            if (matcher.find()) {
+                def name = matcher.group(1).trim()
+                if (name && !name.allWhitespace) {
+                    echo "成功从commit message中提取Author姓名: ${name}"
+                    return name
+                }
+            }
+        }
+    } catch (Exception e) {
+        echo "从commit message提取Author姓名失败: ${e.getMessage()}"
+    }
+    
+    return ''
+}
+
+// ========== 优化的通知功能 ==========
+
+// 发送通知的通用方法
+def sendNotification(buildStatus, buildInfo) {
+    def notificationConfig = getNotificationConfig()
+    
+    // 检查是否启用通知
+    if (!params.ENABLE_NOTIFICATION) {
+        echo "通知功能已禁用，跳过通知发送"
+        return
+    }
+    
+    // 检查通知级别是否匹配
+    if (!shouldSendNotification(buildStatus, notificationConfig)) {
+        echo "通知级别不匹配，跳过通知发送 (当前级别: ${notificationConfig.notificationLevel}, 构建状态: ${buildStatus})"
+        return
+    }
+    
+    // 发送邮件通知
+    if (notificationConfig.emailEnabled) {
+        sendEmailNotification(buildStatus, buildInfo, notificationConfig)
+    }
+    
+    // 发送企业微信通知
+    if (notificationConfig.wechatEnabled) {
+        sendWechatNotification(buildStatus, buildInfo, notificationConfig)
+    }
+    
+    echo "通知发送完成"
+}
+
+// 获取通知配置
+def getNotificationConfig() {
+    // 从环境变量或配置文件读取配置
+    def config = [
+        emailEnabled: true,
+        wechatEnabled: true,
+        emailRecipients: params.DEFAULT_EMAIL_RECIPIENTS,  // 默认接收者，总是包含
+        notificationLevel: 'ALL', // ALL, SUCCESS_ONLY, FAILURE_ONLY
+        includeBuildDetails: true,
+        includeFileList: true,
+        includeErrorLogs: true
+    ]
+    
+    // 添加配置文件中的责任人到邮件接收者
+    if (env.RESPONSIBLE_PERSONS && !env.RESPONSIBLE_PERSONS.allWhitespace) {
+        config.emailRecipients = config.emailRecipients + ',' + env.RESPONSIBLE_PERSONS
+        echo "添加责任人到邮件接收者: ${env.RESPONSIBLE_PERSONS}"
+    }
+    
+    // 添加Gerrit提交人到邮件接收者（仅Gerrit触发时）
+    if (env.isGerritTriggerCause == 'true' && env.GERRIT_SUBMITTER_EMAIL && !env.GERRIT_SUBMITTER_EMAIL.allWhitespace) {
+        config.emailRecipients = config.emailRecipients + ',' + env.GERRIT_SUBMITTER_EMAIL
+        echo "添加Gerrit提交人到邮件接收者: ${env.GERRIT_SUBMITTER_NAME} <${env.GERRIT_SUBMITTER_EMAIL}>"
+    }
+    
+    // 添加手动输入的邮箱到邮件接收者（仅手动触发时）
+    if (env.isGerritTriggerCause != 'true' && params.MANUAL_EMAIL && !params.MANUAL_EMAIL.allWhitespace) {
+        config.emailRecipients = config.emailRecipients + ',' + params.MANUAL_EMAIL
+        echo "添加手动输入的邮箱到接收者: ${params.MANUAL_EMAIL}"
+    }
+    
+    return config
+}
+
+// 检查通知级别是否匹配
+def shouldSendNotification(buildStatus, notificationConfig) {
+    switch(notificationConfig.notificationLevel) {
+        case 'ALL':
+            return true
+        case 'SUCCESS_ONLY':
+            return buildStatus == 'SUCCESS'
+        case 'FAILURE_ONLY':
+            return buildStatus == 'FAILURE'
+        default:
+            return true
+    }
+}
+
+// 构建通知信息
+def buildNotificationInfo(buildStatus) {
+    def downloadUrl = "${env.SVN_BASE_URL}/${env.PROJECT_NAME}/${env.ACTUAL_BRANCH}"
+    
+    // 安全获取配置信息
+    def buildConfig = [:]
+    def javaVersion = env.DEFAULT_JAVA_VERSION
+    def gradleVersion = env.DEFAULT_GRADLE_VERSION
+    
+    try {
+        if (env.BUILD_CONFIG_JSON) {
+            def lazyMap = new groovy.json.JsonSlurper().parseText(env.BUILD_CONFIG_JSON)
+            buildConfig = convertToSerializableMap(lazyMap)
+            javaVersion = getConfigValue(buildConfig, 'JAVA_VERSION', env.DEFAULT_JAVA_VERSION)
+            gradleVersion = getConfigValue(buildConfig, 'GRADLE_VERSION', env.DEFAULT_GRADLE_VERSION)
+        }
+    } catch (Exception e) {
+        echo "解析构建配置失败: ${e.getMessage()}"
+    }
+    
+    def triggerType = env.isGerritTriggerCause == 'true' ? 'Gerrit自动触发' : '手动触发'
+    def platform = env.isGerritTriggerCause == 'true' ? 'all' : params.PARAM_PLATFORM
+    
+    // 根据上传状态生成详细的上传说明
+    def uploadStatus = env.UPLOAD_RESULT_MESSAGE ?: '未上传'
+    def uploadExplanation = ''
+    
+    if (uploadStatus.contains('成功上传')) {
+        uploadExplanation = 'SVN中未检测到同名文件，已成功上传新文件'
+    } else if (uploadStatus.contains('已存在')) {
+        uploadExplanation = 'SVN中已存在同名文件，构建过程正常但未进行上传'
+    } else if (uploadStatus.contains('错误')) {
+        uploadExplanation = '文件上传过程中出现错误'
+    } else {
+        uploadExplanation = '未进行文件上传'
+    }
+    
+    // 获取 apk_urls.txt 更新状态
+    def apkUrlsUpdateStatus = env.APK_URLS_UPDATE_STATUS ?: '未执行'
+    
+    // 获取 Customer 仓库更新状态
+    def customerRepoUpdateStatus = '未执行'
+    if (params.UPDATE_CUSTOMER_REPO) {
+        if (env.APK_URLS_UPDATE_STATUS) {
+            customerRepoUpdateStatus = '已更新'
+        } else if (env.SHOULD_COMPILE == 'true' && env.isGerritTriggerCause != 'true' && params.UPLOAD_TO_SVN) {
+            customerRepoUpdateStatus = '待更新'
+        }
+    } else {
+        customerRepoUpdateStatus = '已禁用'
+    }
+    
+    // 获取关联的 Customer 仓库数量（从 apkinfo.json 的 repositoryList 统计）
+    // 数量信息现在存储在 CUSTOMER_REPO_COUNT 环境变量中
+    def customerRepoCount = 0
+    try {
+        if (env.CUSTOMER_REPO_COUNT) {
+            customerRepoCount = env.CUSTOMER_REPO_COUNT.toInteger()
+        }
+    } catch (Exception e) {
+        echo "获取 Customer 仓库数量失败: ${e.getMessage()}"
+    }
+    
+    return [
+        projectName: env.PROJECT_NAME,
+        branch: env.ACTUAL_BRANCH,
+        buildNumber: env.BUILD_NUMBER,
+        buildStatus: buildStatus,
+        buildUrl: env.BUILD_URL,
+        triggerType: triggerType,
+        platform: platform,
+        buildType: params.IS_NOT_DEBUG,
+        uploadStatus: uploadStatus,
+        uploadExplanation: uploadExplanation,
+        javaVersion: javaVersion,
+        gradleVersion: gradleVersion,
+        downloadUrl: downloadUrl,
+        apkFiles: env.APK_FILES ?: '',
+        mappingFiles: env.MAPPING_FILES ?: '',
+        responsiblePersons: env.RESPONSIBLE_PERSONS ?: '',
+        gerritSubmitterName: env.GERRIT_SUBMITTER_NAME ?: '',
+        gerritSubmitterEmail: env.GERRIT_SUBMITTER_EMAIL ?: '',
+        isAutoTrigger: false,
+        uploadSkipped: false,
+        // 新增：apk_urls.txt 更新状态 (Requirements 7.1)
+        apkUrlsUpdateStatus: apkUrlsUpdateStatus,
+        // 新增：Customer 仓库更新状态
+        customerRepoUpdateStatus: customerRepoUpdateStatus,
+        // 新增：关联的 Customer 仓库数量
+        customerRepoCount: customerRepoCount
+    ]
+}
+
+// 发送邮件通知
+def sendEmailNotification(buildStatus, buildInfo, notificationConfig) {
+    def subject = "${buildInfo.projectName}自动构建 - Build #${buildInfo.buildNumber} - ${buildStatus}"
+    
+    def emailBody = """
+${buildInfo.projectName}自动构建状态报告
+========================================
+
+构建信息:
+- 项目名称: ${buildInfo.projectName}
+- 构建分支: ${buildInfo.branch}
+- 构建编号: #${buildInfo.buildNumber}
+- 构建状态: ${buildStatus}
+- 触发方式: ${buildInfo.triggerType}
+"""
+    
+    if (notificationConfig.includeBuildDetails) {
+        emailBody += """
+- 构建平台: ${buildInfo.platform}
+- 构建类型: ${buildInfo.buildType}
+
+上传状态:
+- 上传结果: ${buildInfo.uploadStatus}
+- 说明: ${buildInfo.uploadExplanation}
+- SVN 路径: ReleaseApk/xbh3/${buildInfo.projectName}/${buildInfo.branch}/
+
+Customer 仓库更新:
+- 更新状态: ${buildInfo.customerRepoUpdateStatus}
+- 关联仓库数量: ${buildInfo.customerRepoCount}
+- apk_urls.txt 更新: ${buildInfo.apkUrlsUpdateStatus}
+
+技术信息:
+- 构建工具: Gradle ${buildInfo.gradleVersion}, Java ${buildInfo.javaVersion}
+- 构建链接: ${buildInfo.buildUrl}
+  ⚠️ 重要说明：此链接请在安全空间中查看！
+"""
+    }
+    
+    // 添加责任人信息
+    if (buildInfo.responsiblePersons && !buildInfo.responsiblePersons.allWhitespace) {
+        emailBody += """
+- 项目责任人: ${buildInfo.responsiblePersons}
+"""
+    }
+    
+    // 添加Gerrit提交人信息（仅Gerrit触发时）
+    if (buildInfo.gerritSubmitterEmail && !buildInfo.gerritSubmitterEmail.allWhitespace) {
+        if (buildInfo.gerritSubmitterName && !buildInfo.gerritSubmitterName.allWhitespace && buildInfo.gerritSubmitterName != '未知提交人') {
+            emailBody += """
+- Gerrit提交人: ${buildInfo.gerritSubmitterName} <${buildInfo.gerritSubmitterEmail}>
+"""
+        } else {
+            emailBody += """
+- Gerrit提交人: ${buildInfo.gerritSubmitterEmail}
+"""
+        }
+    }
+    
+    emailBody += "\n"
+    
+    if (buildStatus == 'SUCCESS' && notificationConfig.includeFileList) {
+        if (buildInfo.isAutoTrigger) {
+            // 自动触发：只显示编译成功，不提供下载链接
+            emailBody += "编译验证:\n"
+            emailBody += "- ✅ 所有flavor编译成功\n"
+            emailBody += "- ℹ️ 自动触发构建仅验证编译，未上传文件\n\n"
+        } else if (buildInfo.apkFiles && !buildInfo.apkFiles.allWhitespace) {
+            // 手动触发：提供下载链接
+            emailBody += "生成文件:\n"
+            emailBody += "\nAPK文件:\n"
+            def apkList = buildInfo.apkFiles.split('\n')
+            apkList.each { fileName ->
+                emailBody += "- ${buildInfo.downloadUrl}/${fileName}\n"
+            }
+            
+            if (buildInfo.mappingFiles && !buildInfo.mappingFiles.allWhitespace) {
+                emailBody += "\nMapping文件:\n"
+                def mappingList = buildInfo.mappingFiles.split('\n')
+                mappingList.each { fileName ->
+                    emailBody += "- ${buildInfo.downloadUrl}/${fileName}\n"
+                }
+            }
+            emailBody += "\n"
+        }
+    } else if (buildStatus == 'FAILURE' && notificationConfig.includeErrorLogs) {
+        emailBody += "错误信息:\n"
+        emailBody += "- 详细日志: ${buildInfo.buildUrl}console\n"
+        
+        // 添加错误日志摘要
+        if (buildInfo.errorLog && buildInfo.errorLog != '无法获取详细错误日志') {
+            emailBody += "- 错误摘要:\n"
+            def errorLines = buildInfo.errorLog.split('\n')
+            def errorCount = Math.min(errorLines.size(), 10) // 最多显示10行错误
+            for (int i = 0; i < errorCount; i++) {
+                emailBody += "  ${errorLines[i]}\n"
+            }
+            if (errorLines.size() > 10) {
+                emailBody += "  ... (更多错误信息请查看完整日志)\n"
+            }
+        }
+        emailBody += "\n"
+    }
+    
+    emailBody += "========================================\n"
+    emailBody += "构建时间: ${new Date()}\n"
+    
+    // 打印调试信息
+    echo "准备发送邮件..."
+    echo "收件人: ${notificationConfig.emailRecipients}"
+    echo "主题: ${subject}"
+    
+    // 发送邮件（无重试）
+    try {
+        emailext(
+            subject: subject,
+            to: notificationConfig.emailRecipients,
+            body: emailBody
+        )
+        echo "邮件通知发送成功"
+    } catch (Exception e) {
+        echo "邮件发送失败: ${e.getMessage()}"
+        // 不重试，直接记录失败
+    }
+}
+
+// 发送企业微信通知
+def sendWechatNotification(buildStatus, buildInfo, notificationConfig) {
+    def statusIcon = buildStatus == 'SUCCESS' ? '✅' : '❌'
+    
+    def wechatMessage = """
+${statusIcon}【${buildInfo.projectName}构建${buildStatus == 'SUCCESS' ? '成功' : '失败'}】
+
+📋 项目信息
+• 项目: ${buildInfo.projectName}
+• 分支: ${buildInfo.branch}
+• 构建: #${buildInfo.buildNumber}
+• 触发: ${buildInfo.triggerType}
+"""
+    
+    if (notificationConfig.includeBuildDetails) {
+        wechatMessage += """
+⚙️ 构建配置
+• 平台: ${buildInfo.platform}
+• 类型: ${buildInfo.buildType}
+• 工具: Java${buildInfo.javaVersion}/Gradle${buildInfo.gradleVersion}
+
+📊 构建结果
+• 构建状态: ${buildStatus}
+• 上传结果: ${buildInfo.uploadStatus}
+• 说明: ${buildInfo.uploadExplanation}
+• SVN路径: xbh3/${buildInfo.projectName}/${buildInfo.branch}/
+• 链接: ${buildInfo.buildUrl}
+  ⚠️ 重要说明：此链接请在安全空间中查看！
+
+📦 Customer 仓库更新
+• 更新状态: ${buildInfo.customerRepoUpdateStatus}
+• 关联仓库: ${buildInfo.customerRepoCount} 个
+• apk_urls.txt: ${buildInfo.apkUrlsUpdateStatus}
+"""
+    }
+    
+    // 添加责任人信息
+    if (buildInfo.responsiblePersons && !buildInfo.responsiblePersons.allWhitespace) {
+        wechatMessage += """
+👤 项目责任人
+• ${buildInfo.responsiblePersons}
+"""
+    }
+    
+    // 添加Gerrit提交人信息（仅Gerrit触发时）
+    if (buildInfo.gerritSubmitterEmail && !buildInfo.gerritSubmitterEmail.allWhitespace) {
+        if (buildInfo.gerritSubmitterName && !buildInfo.gerritSubmitterName.allWhitespace && buildInfo.gerritSubmitterName != '未知提交人') {
+            wechatMessage += """
+👨‍💻 Gerrit提交人
+• ${buildInfo.gerritSubmitterName} <${buildInfo.gerritSubmitterEmail}>
+"""
+        } else {
+            wechatMessage += """
+👨‍💻 Gerrit提交人
+• ${buildInfo.gerritSubmitterEmail}
+"""
+        }
+    }
+    
+    if (buildStatus == 'SUCCESS') {
+        if (buildInfo.isAutoTrigger) {
+            // 自动触发：只显示编译成功
+            wechatMessage += """
+✅ 编译验证
+• 所有flavor编译成功
+• 自动触发构建仅验证编译，未上传文件
+"""
+        } else if (buildInfo.apkFiles && !buildInfo.apkFiles.allWhitespace) {
+            // 手动触发：提供下载链接
+            wechatMessage += "\n📦 下载地址\n"
+            
+            def apkList = buildInfo.apkFiles.split('\n')
+            wechatMessage += "• APK文件 (${apkList.size()}个):\n"
+            apkList.each { fileName ->
+                wechatMessage += "  ${buildInfo.downloadUrl}/${fileName}\n"
+            }
+            
+            if (buildInfo.mappingFiles && !buildInfo.mappingFiles.allWhitespace) {
+                def mappingList = buildInfo.mappingFiles.split('\n')
+                wechatMessage += "• Mapping文件 (${mappingList.size()}个):\n"
+                mappingList.each { fileName ->
+                    wechatMessage += "  ${buildInfo.downloadUrl}/${fileName}\n"
+                }
+            }
+        }
+    } else if (buildStatus == 'FAILURE' && notificationConfig.includeErrorLogs) {
+        wechatMessage += "\n🚨 错误信息\n• 日志: ${buildInfo.buildUrl}console\n  ⚠️ 重要说明：此链接请在安全空间中查看！\n"
+        
+        // 添加错误日志摘要
+        if (buildInfo.errorLog && buildInfo.errorLog != '无法获取详细错误日志') {
+            wechatMessage += "• 错误摘要:\n"
+            def errorLines = buildInfo.errorLog.split('\n')
+            def errorCount = Math.min(errorLines.size(), 5) // 微信通知最多显示5行错误
+            for (int i = 0; i < errorCount; i++) {
+                def line = errorLines[i].trim()
+                if (line && line.length() > 50) {
+                    line = line.substring(0, 47) + "..."
+                }
+                wechatMessage += "  ${line}\n"
+            }
+            if (errorLines.size() > 5) {
+                wechatMessage += "  ... (更多错误信息请查看完整日志)\n"
+            }
+        }
+    }
+    
+    // 发送企业微信通知（不重试，不等待）
+    try {
+        sh """
+            curl -X POST '${env.WECHAT_WEBHOOK}' \\
+                -H 'Content-Type: application/x-www-form-urlencoded' \\
+                -d 'hookKey=${env.WECHAT_HOOKKEY}' \\
+                --data-urlencode 'content=${wechatMessage}' \\
+                --max-time 10
+        """
+        echo "企业微信通知发送成功"
+    } catch (Exception e) {
+        echo "企业微信通知发送失败: ${e.getMessage()}"
+    }
+}
+
+// 发送自动触发的成功通知（不包含下载链接）
+def sendAutoTriggerSuccessNotification() {
+    def buildInfo = buildNotificationInfo('SUCCESS')
+    buildInfo.isAutoTrigger = true
+    buildInfo.uploadSkipped = true
+    sendNotification('SUCCESS', buildInfo)
+}
+
+// 发送成功通知（包含下载链接）
+def sendSuccessNotification() {
+    def buildInfo = buildNotificationInfo('SUCCESS')
+    buildInfo.isAutoTrigger = false
+    sendNotification('SUCCESS', buildInfo)
+}
+
+// 发送失败通知
+def sendFailureNotification() {
+    def buildInfo = buildNotificationInfo('FAILURE')
+    
+    // 为失败通知添加额外的错误信息
+    try {
+        // 获取构建日志的最后几行错误信息
+        def errorLog = currentBuild.rawBuild.getLog(50).join('\n')
+        buildInfo.errorLog = errorLog
+    } catch (Exception e) {
+        buildInfo.errorLog = "无法获取错误日志: ${e.getMessage()}"
+    }
+    
+    sendNotification('FAILURE', buildInfo)
+}
+
+// 发送配置失败通知
+def sendConfigFailureNotification(failureMessage) {
+    def subject = "${env.PROJECT_NAME ?: '未知项目'}构建配置失败 - Build #${env.BUILD_NUMBER ?: '未知'}"
+    
+    def emailBody = """
+${env.PROJECT_NAME ?: '未知项目'}构建配置失败报告
+========================================
+
+构建信息:
+- 项目名称: ${env.PROJECT_NAME ?: '未知'}
+- 构建分支: ${env.ACTUAL_BRANCH ?: '未知'}
+- 构建编号: #${env.BUILD_NUMBER ?: '未知'}
+- 构建状态: FAILURE
+- 触发方式: ${env.isGerritTriggerCause == 'true' ? 'Gerrit自动触发' : '手动触发'}
+
+配置失败原因:
+- ${failureMessage}
+
+技术信息:
+- 构建链接: ${env.BUILD_URL ?: '未知'}
+  ⚠️ 重要说明：此链接请在安全空间中查看！
+
+========================================
+构建时间: ${new Date()}
+"""
+    
+    // 发送邮件通知
+    try {
+        emailext(
+            subject: subject,
+            to: params.DEFAULT_EMAIL_RECIPIENTS,
+            body: emailBody
+        )
+        echo "配置失败邮件通知发送成功"
+    } catch (Exception e) {
+        echo "配置失败邮件通知发送失败: ${e.getMessage()}"
+    }
+    
+    // 发送企业微信通知
+    def wechatMessage = """
+❌【${env.PROJECT_NAME ?: '未知项目'}配置失败】
+
+📋 项目信息
+• 项目: ${env.PROJECT_NAME ?: '未知'}
+• 分支: ${env.ACTUAL_BRANCH ?: '未知'}
+• 构建: #${env.BUILD_NUMBER ?: '未知'}
+• 触发: ${env.isGerritTriggerCause == 'true' ? 'Gerrit自动触发' : '手动触发'}
+
+🚨 配置失败原因
+• ${failureMessage}
+
+• 链接: ${env.BUILD_URL ?: '未知'}
+  ⚠️ 重要说明：此链接请在安全空间中查看！
+"""
+    
+    try {
+        sh """
+            curl -X POST '${env.WECHAT_WEBHOOK}' \\
+                -H 'Content-Type: application/x-www-form-urlencoded' \\
+                -d 'hookKey=${env.WECHAT_HOOKKEY}' \\
+                --data-urlencode 'content=${wechatMessage}' \\
+                --max-time 10
+        """
+        echo "配置失败企业微信通知发送成功"
+    } catch (Exception e) {
+        echo "配置失败企业微信通知发送失败: ${e.getMessage()}"
+    }
+}
+
+// ========== 信息文件生成函数 ==========
+
+/**
+ * 解析 CUSTOMER_REPOSITORIES 配置字符串
+ * 
+ * @param configString 配置字符串，格式：server1|repo1:branch1,server2|repo2:branch2
+ * @return CustomerRepository 列表，每个元素包含 server、repository 和 branch 字段
+ * 
+ * Requirements: 4.1, 4.4, 9.1, 9.4
+ * 
+ * 支持两种格式：
+ * 1. 单行格式（逗号分隔）：server1|repo1:branch1,server2|repo2:branch2
+ * 2. 多行格式（换行符分隔）：
+ *    server1|repo1:branch1
+ *    server2|repo2:branch2
+ */
+def parseCustomerRepositories(String configString) {
+    def repositories = []
+    
+    if (!configString || configString.trim().isEmpty()) {
+        return repositories
+    }
+    
+    // 支持多行格式和单行格式
+    // 如果包含换行符，按换行符分隔；否则按逗号分隔
+    def entries
+    if (configString.contains('\n')) {
+        // 多行格式：按换行符分隔
+        entries = configString.split('\n')
+    } else {
+        // 单行格式：按逗号分隔
+        entries = configString.split(',')
+    }
+    
+    entries.each { entry ->
+        entry = entry.trim()
+        
+        // 跳过空行和注释行
+        if (!entry || entry.startsWith('#')) {
+            return // continue to next entry
+        }
+        
+        if (entry.contains('|') && entry.contains(':')) {
+            // 格式：server|repo:branch
+            def pipeIndex = entry.indexOf('|')
+            def server = entry.substring(0, pipeIndex).trim()
+            def repoAndBranch = entry.substring(pipeIndex + 1).trim()
+            
+            def colonIndex = repoAndBranch.lastIndexOf(':')
+            if (colonIndex > 0) {
+                def repo = repoAndBranch.substring(0, colonIndex).trim()
+                def branch = repoAndBranch.substring(colonIndex + 1).trim()
+                if (server && repo && branch) {
+                    repositories.add([
+                        server: server,
+                        repository: repo,
+                        branch: branch
+                    ])
+                }
+            }
+        } else if (entry.contains(':')) {
+            // 兼容旧格式：repo:branch（无服务器地址）
+            def colonIndex = entry.lastIndexOf(':')
+            if (colonIndex > 0) {
+                def repo = entry.substring(0, colonIndex).trim()
+                def branch = entry.substring(colonIndex + 1).trim()
+                if (repo && branch) {
+                    repositories.add([
+                        server: '',
+                        repository: repo,
+                        branch: branch
+                    ])
+                }
+            }
+        }
+    }
+    
+    return repositories
+}
+
+/**
+ * 生成 repository_list.info 文件内容
+ * 
+ * @param repositories CustomerRepository 列表，每个元素包含 server、repository 和 branch 字段
+ * @return 格式化的 repository_list.info 内容字符串
+ * 
+ * Requirements: 4.2
+ */
+def generateRepositoryListInfo(List repositories) {
+    if (!repositories || repositories.isEmpty()) {
+        return '[]'
+    }
+    
+    def content = '['
+    repositories.each { repo ->
+        if (repo.server) {
+            content += "server:${repo.server},repository:${repo.repository},branch:${repo.branch};"
+        } else {
+            // 兼容无服务器地址的情况
+            content += "repository:${repo.repository},branch:${repo.branch};"
+        }
+    }
+    content += ']'
+    
+    return content
+}
+
+/**
+ * 生成 SVN 路径
+ * 
+ * @param projectName 项目名称，如 XbhLauncher
+ * @param branch 分支名称，如 develop-common
+ * @param channel 渠道名称，如 xbh
+ * @return 完整的 SVN 路径（xbh3/项目名/分支/渠道/）
+ * 
+ * Requirements: 6.2
+ */
+def generateSvnPath(String projectName, String branch, String channel) {
+    return "xbh3/${projectName}/${branch}/${channel}/"
+}
+
+/**
+ * 生成 APK 下载 URL
+ * 
+ * @param projectName 项目名称，如 XbhLauncher
+ * @param branch 分支名称，如 develop-common
+ * @param channel 渠道名称，如 xbh
+ * @param apkFileName APK 文件名，如 XbhLauncher_1.0.0_xbh.apk
+ * @return 完整的 HTTP 下载 URL
+ * 
+ * Requirements: 7.5
+ */
+def generateApkDownloadUrl(String projectName, String branch, String channel, String apkFileName) {
+    return "http://192.168.1.182:8088/scm/svn/ReleaseApk/xbh3/${projectName}/${branch}/${channel}/${apkFileName}"
+}
+
+/**
+ * 生成 apk_urls.txt 文件名
+ * 
+ * @param customerRepo Customer 仓库路径，如 A311D2_R/platform/Customer
+ * @param branch 分支名称，如 dev1
+ * @return apk_urls.txt 文件名（仓库名_分支名_apk_urls.txt），其中仓库路径中的 / 替换为 _
+ * 
+ * Requirements: 7.2
+ */
+def generateApkUrlsFileName(String customerRepo, String branch) {
+    def sanitizedRepo = customerRepo.replace('/', '_')
+    return "${sanitizedRepo}_${branch}_apk_urls.txt"
+}
+
+// [已禁用] 以下两个函数用于推送到 Customer Git 仓库，现已注释
+// /**
+//  * 更新 apk_urls.txt 文件并推送到 Customer Git 仓库
+//  * 
+//  * 注意：apk_urls.txt 已在 Upload to SVN 阶段和 APK 一起上传到 SVN，
+//  * 此函数仅负责推送到 Customer Git 仓库（绕过 Gerrit 直接强推）
+//  * 
+//  * @param customerRepo Customer 仓库路径，如 A311D2_R/platform/Customer
+//  * @param branch 分支名称，如 dev1
+//  * @param newApkUrl 新的 APK 下载链接
+//  * @param server Git 服务器地址，如 192.168.1.182:8080
+//  * @return boolean 操作是否成功
+//  * 
+//  * Requirements: 7.1, 7.3, 7.4
+//  */
+// def updateApkUrlsFile(String customerRepo, String branch, String newApkUrl, String server = '') {
+//     def fileName = generateApkUrlsFileName(customerRepo, branch)
+//     def localTempFile = "${env.WORKSPACE}/temp_${fileName}"
+//     
+//     echo "更新 apk_urls.txt 文件: ${fileName}"
+//     echo "新增 APK URL: ${newApkUrl}"
+//     
+//     try {
+//         // 创建包含新 APK URL 的临时文件
+//         // 注意：这里只是为了推送到 Git 仓库，SVN 上传已在 Upload to SVN 阶段完成
+//         def updatedContent = appendApkUrl('', newApkUrl)
+//         writeFile file: localTempFile, text: updatedContent
+//         
+//         def gitSuccess = false
+//         
+//         // 推送到 Customer Git 仓库
+//         if (server && customerRepo && branch) {
+//             gitSuccess = pushApkUrlsToGitRepo(server, customerRepo, branch, localTempFile, fileName)
+//         } else {
+//             echo "未提供 Git 服务器信息，跳过 Git 仓库推送"
+//             gitSuccess = true // 不算失败
+//         }
+//         
+//         // 清理临时文件
+//         sh "rm -f '${localTempFile}'"
+//         
+//         return gitSuccess
+//         
+//     } catch (Exception e) {
+//         echo "更新 apk_urls.txt 文件失败: ${e.getMessage()}"
+//         // 清理临时文件
+//         sh "rm -f '${localTempFile}' 2>/dev/null || true"
+//         return false
+//     }
+// }
+
+// /**
+//  * 推送 apk_urls.txt 到 Customer Git 仓库
+//  * 
+//  * 使用 SSH 方式绕过 Gerrit 直接强推到目标分支
+//  * 
+//  * @param server Git 服务器地址，如 192.168.1.182:8080 (端口会被转换为 SSH 端口)
+//  * @param repositoryPath 仓库路径，如 rk3576_U/platform/Customer
+//  * @param branch 目标分支，如 develop-1.0.0-EDLA
+//  * @param localFilePath 本地文件路径
+//  * @param fileName 文件名
+//  * @return boolean 操作是否成功
+//  */
+// def pushApkUrlsToGitRepo(String server, String repositoryPath, String branch, String localFilePath, String fileName) {
+//     // 从 server 中提取主机名（去掉端口）
+//     def serverHost = server.contains(':') ? server.split(':')[0] : server
+//     
+//     // 构建 SSH URL 格式: ssh://git@{host}:8080/{repositoryPath}
+//     // 或者标准 SSH 格式: git@{host}:{repositoryPath}
+//     // 这里使用 Gerrit 的 SSH 端口 8080
+//     def gitRepoUrl = "ssh://git@${serverHost}:8080/${repositoryPath}"
+//     def tempGitDir = "${env.WORKSPACE}/temp_git_${repositoryPath.replace('/', '_')}_${System.currentTimeMillis()}"
+//     
+//     echo "=============================="
+//     echo "推送 apk_urls.txt 到 Git 仓库 (SSH)"
+//     echo "Git 仓库: ${gitRepoUrl}"
+//     echo "目标分支: ${branch}"
+//     echo "文件名: ${fileName}"
+//     
+//     try {
+//         // 创建临时目录
+//         sh "mkdir -p '${tempGitDir}'"
+//         
+//         // 克隆仓库（只克隆目标分支，深度为1）
+//         echo "克隆仓库..."
+//         def cloneResult = sh(
+//             script: """
+//                 cd '${tempGitDir}' && \\
+//                 GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git clone --depth 1 --branch '${branch}' '${gitRepoUrl}' repo 2>&1
+//             """,
+//             returnStatus: true
+//         )
+//         
+//         if (cloneResult != 0) {
+//             echo "使用指定分支克隆失败，尝试克隆默认分支..."
+//             def cloneResult2 = sh(
+//                 script: """
+//                     cd '${tempGitDir}' && \\
+//                     rm -rf repo && \\
+//                     GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git clone --depth 1 '${gitRepoUrl}' repo 2>&1
+//                 """,
+//                 returnStatus: true
+//             )
+//             
+//             if (cloneResult2 != 0) {
+//                 echo "克隆仓库失败，跳过此仓库的推送"
+//                 sh "rm -rf '${tempGitDir}' 2>/dev/null || true"
+//                 return false
+//             }
+//         }
+//         
+//         // 切换到目标分支
+//         echo "切换到分支: ${branch}"
+//         sh """
+//             cd '${tempGitDir}/repo' && \\
+//             GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git fetch origin '${branch}' 2>/dev/null || true && \\
+//             git checkout '${branch}' 2>/dev/null || git checkout -b '${branch}'
+//         """
+//         
+//         // 复制 apk_urls.txt 文件到仓库
+//         // 使用简化的文件名 apk_urls.txt
+//         def targetFileName = "apk_urls.txt"
+//         echo "复制文件到仓库: ${targetFileName}"
+//         sh "cp '${localFilePath}' '${tempGitDir}/repo/${targetFileName}'"
+//         
+//         // 配置 Git 用户信息
+//         sh """
+//             cd '${tempGitDir}/repo' && \\
+//             git config user.email 'jenkins@lango-tech.cn' && \\
+//             git config user.name 'Jenkins CI'
+//         """
+//         
+//         // 添加并提交
+//         echo "提交更改..."
+//         def commitResult = sh(
+//             script: """
+//                 cd '${tempGitDir}/repo' && \\
+//                 git add '${targetFileName}' && \\
+//                 git diff --cached --quiet || git commit -m '[CI] Update apk_urls.txt - Build #${BUILD_NUMBER}'
+//             """,
+//             returnStatus: true
+//         )
+//         
+//         if (commitResult != 0) {
+//             echo "提交失败或没有更改需要提交"
+//         }
+//         
+//         // 强推到远程分支（绕过 Gerrit，直接推送到分支而不是 refs/for）
+//         echo "强推到远程分支: ${branch}"
+//         sh """
+//             cd '${tempGitDir}/repo' && \\
+//             GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git push -f origin HEAD:'${branch}'
+//         """
+//         
+//         echo "成功推送到 Git 仓库: ${repositoryPath} (${branch})"
+//         
+//         // 清理临时目录
+//         sh "rm -rf '${tempGitDir}'"
+//         
+//         return true
+//         
+//     } catch (Exception e) {
+//         echo "推送到 Git 仓库失败: ${e.getMessage()}"
+//         // 清理临时目录
+//         sh "rm -rf '${tempGitDir}' 2>/dev/null || true"
+//         return false
+//     }
+// }
+
+/**
+ * 追加 APK URL 到现有内容
+ * 
+ * 将新的 APK URL 追加到现有内容末尾，确保不丢失原有链接。
+ * 
+ * @param existingContent 现有文件内容
+ * @param newApkUrl 新的 APK 下载链接
+ * @return 更新后的文件内容
+ * 
+ * Requirements: 7.4
+ */
+def appendApkUrl(String existingContent, String newApkUrl) {
+    if (!newApkUrl || newApkUrl.trim().isEmpty()) {
+        return existingContent ?: ''
+    }
+
+    def normalizeUrl = { String url ->
+        def trimmed = url?.trim()
+        if (!trimmed) {
+            return ''
+        }
+        def matcher = trimmed =~ /(.*)_\d+(?:\.\d+)+_[0-9a-fA-F]+(?:_[^\\/]+)?\.apk$/
+        if (matcher.matches()) {
+            return matcher[0][1]
+        }
+        if (trimmed.endsWith('.apk')) {
+            return trimmed.substring(0, trimmed.length() - 4)
+        }
+        return trimmed
+    }
+
+    if (!existingContent || existingContent.trim().isEmpty()) {
+        return existingContent ?: ''
+    }
+
+    def newKey = normalizeUrl(newApkUrl)
+    def replaced = false
+    def lines = existingContent.readLines()
+    def updatedLines = lines.collect { line ->
+        def trimmed = line?.trim()
+        if (!trimmed) {
+            return line
+        }
+        if (normalizeUrl(trimmed) == newKey) {
+            if (replaced) {
+                return null
+            }
+            replaced = true
+            return newApkUrl
+        }
+        return line
+    }.findAll { it != null }
+
+    if (!replaced) {
+        return existingContent
+    }
+
+    return updatedLines.join('\n')
+}
+
+// ========== SVN 上传辅助函数 ==========
+
+/**
+ * 从 APK 文件路径或文件名中提取渠道信息
+ * 
+ * @param apkFilePath APK 文件完整路径
+ * @param apkFileName APK 文件名
+ * @return 渠道名称
+ */
+def extractChannelFromApk(String apkFilePath, String apkFileName) {
+    // 尝试从文件名中提取渠道
+    // 假设文件名格式为: ProjectName_version_channel.apk 或 ProjectName-channel-version.apk
+    
+    // 移除 .apk 后缀
+    def baseName = apkFileName.replace('.apk', '')
+    
+    // 尝试匹配常见的命名模式
+    // 模式1: ProjectName_version_channel (如 XbhLauncher_1.0.0_xbh)
+    def matcher1 = baseName =~ /.*_([^_]+)$/
+    if (matcher1.find()) {
+        def channel = matcher1.group(1)
+        // 排除版本号格式（如 1.0.0）
+        if (!channel.matches(/^\d+(\.\d+)*$/)) {
+            return channel
+        }
+    }
+    
+    // 模式2: ProjectName-channel-version (如 XbhLauncher-xbh-1.0.0)
+    def matcher2 = baseName =~ /.*-([a-zA-Z]+)-\d+/
+    if (matcher2.find()) {
+        return matcher2.group(1)
+    }
+    
+    // 尝试从目录结构中提取渠道
+    // 假设目录结构为: out/channel/xxx.apk
+    def pathParts = apkFilePath.tokenize('/')
+    if (pathParts.size() >= 2) {
+        def parentDir = pathParts[-2]
+        // 如果父目录不是 out，可能是渠道目录
+        if (parentDir != 'out' && !parentDir.matches(/^\d+(\.\d+)*$/)) {
+            return parentDir
+        }
+    }
+    
+    // 默认返回 'default' 渠道
+    return 'default'
+}
+
+/**
+ * 上传单个文件到 SVN
+ * 
+ * @param localPath 本地文件路径
+ * @param remoteUrl SVN 远程 URL
+ * @param fileType 文件类型描述（用于日志）
+ * @return boolean 上传是否成功
+ */
+def uploadFileToSvn(String localPath, String remoteUrl, String fileType) {
+    echo "上传 ${fileType}: ${localPath} -> ${remoteUrl}"
+    
+    try {
+        // 检查文件是否已存在
+        def fileExists = sh(script: """
+            svn ls "${remoteUrl}" --username "\$SVN_USER" --password "\$SVN_PASS" --no-auth-cache --non-interactive >/dev/null 2>&1 && echo "exists" || echo "not_exists"
+        """, returnStdout: true).trim()
+        
+        if (fileExists == "exists") {
+            if (env.FORCE_UPLOAD == 'true') {
+                echo "${fileType} 文件已存在，强制覆盖..."
+                // 先删除旧文件
+                sh(script: """
+                    svn delete "${remoteUrl}" \\
+                        -m "强制覆盖: 删除旧版本 ${fileType} - Build ${BUILD_NUMBER}" \\
+                        --username "\$SVN_USER" \\
+                        --password "\$SVN_PASS" \\
+                        --no-auth-cache \\
+                        --non-interactive
+                """)
+            } else {
+                echo "${fileType} 文件已存在，跳过上传: ${remoteUrl}"
+                return true // 视为成功（跳过）
+            }
+        }
+        
+        // 上传文件
+        def uploadResult = sh(script: """
+            svn import --force "${localPath}" "${remoteUrl}" \\
+                -m "自动构建上传: ${env.PROJECT_NAME} - ${fileType} - ${env.ACTUAL_BRANCH} - Build ${BUILD_NUMBER}" \\
+                --username "\$SVN_USER" \\
+                --password "\$SVN_PASS" \\
+                --no-auth-cache \\
+                --non-interactive
+        """, returnStatus: true)
+        
+        if (uploadResult == 0) {
+            echo "${fileType} 上传成功: ${remoteUrl}"
+            return true
+        } else {
+            echo "${fileType} 上传失败: ${remoteUrl}"
+            return false
+        }
+    } catch (Exception e) {
+        echo "${fileType} 上传异常: ${e.getMessage()}"
+        return false
+    }
+}
+
+// ========== apkinfo.json 解析函数 ==========
+
+/**
+ * 解析 apkinfo.json 文件
+ * 
+ * @param jsonFilePath apkinfo.json 文件路径
+ * @return 包含 flavor、version、buildTime、apkFileName、repositoryList 的 Map
+ *         如果解析失败返回 null
+ * 
+ * Requirements: 4.2, 4.4
+ */
+def parseApkInfoJson(String jsonFilePath) {
+    if (!jsonFilePath || !fileExists(jsonFilePath)) {
+        echo "apkinfo.json 文件不存在: ${jsonFilePath}"
+        return null
+    }
+    
+    try {
+        def jsonContent = readFile(jsonFilePath)
+        def lazyMap = new groovy.json.JsonSlurper().parseText(jsonContent)
+        
+        // 将 LazyMap 转换为普通 HashMap，避免 Jenkins 序列化问题
+        def apkInfo = convertToSerializableMap(lazyMap)
+        
+        // 验证必需字段（repositoryList 可选）
+        def requiredFields = ['flavor', 'version', 'buildTime', 'apkFileName']
+        def missingFields = requiredFields.findAll { !apkInfo.containsKey(it) }
+        
+        if (missingFields) {
+            echo "apkinfo.json 缺少必需字段: ${missingFields.join(', ')}"
+            return null
+        }
+        
+        echo "成功解析 apkinfo.json:"
+        echo "  - flavor: ${apkInfo.flavor}"
+        echo "  - version: ${apkInfo.version}"
+        echo "  - buildTime: ${apkInfo.buildTime}"
+        echo "  - apkFileName: ${apkInfo.apkFileName}"
+        echo "  - repositoryList: ${apkInfo.repositoryList?.size() ?: 0} 个仓库"
+        
+        return apkInfo
+    } catch (Exception e) {
+        echo "解析 apkinfo.json 失败: ${e.getMessage()}"
+        return null
+    }
+}
+
+/**
+ * 将 LazyMap 转换为可序列化的 HashMap
+ * 解决 Jenkins Pipeline 中 groovy.json.internal.LazyMap 不可序列化的问题
+ * 
+ * @param obj 要转换的对象
+ * @return 可序列化的对象
+ */
+def convertToSerializableMap(obj) {
+    if (obj instanceof Map) {
+        def result = [:]
+        obj.each { key, value ->
+            result[key] = convertToSerializableMap(value)
+        }
+        return result
+    } else if (obj instanceof List) {
+        return obj.collect { convertToSerializableMap(it) }
+    } else {
+        return obj
+    }
+}
+
+/**
+ * 从 apkInfo 中获取 repositoryList
+ * 
+ * @param apkInfo 解析后的 apkInfo Map
+ * @return CustomerRepository 列表，每个元素包含 server、repositoryPath、branch 字段
+ *         如果 apkInfo 为空或 repositoryList 不存在，返回空列表
+ * 
+ * Requirements: 4.4
+ */
+def getRepositoryListFromApkInfo(Map apkInfo) {
+    if (!apkInfo || !apkInfo.repositoryList) {
+        return []
+    }
+    
+    def repositories = []
+    
+    apkInfo.repositoryList.each { repo ->
+        // 验证每个仓库对象包含必需字段
+        if (repo.server && repo.repositoryPath && repo.branch) {
+            repositories.add([
+                server: repo.server?.toString(),
+                repositoryPath: repo.repositoryPath?.toString(),
+                branch: repo.branch?.toString()
+            ])
+        } else {
+            echo "警告: repositoryList 中的仓库对象缺少必需字段: ${repo}"
+        }
+    }
+    
+    return repositories
+}
+
+/**
+ * 查找 APK 对应的 apkinfo.json 文件
+ * 
+ * 支持两种命名格式：
+ * 1. apkinfo.{APK文件名}.json (旧格式)
+ * 2. apkInfo_{APK文件名去掉.apk}.json (新格式)
+ * 
+ * @param apkFilePath APK 文件路径
+ * @param apkFileName APK 文件名
+ * @return apkinfo.json 文件路径，如果不存在返回 null
+ * 
+ * Requirements: 4.1
+ */
+def findApkInfoJsonFile(String apkFilePath, String apkFileName) {
+    // 提取 APK 所在目录
+    def apkDir = apkFilePath.substring(0, apkFilePath.lastIndexOf('/'))
+    
+    // 提取 APK 基础名（去掉 .apk 后缀）
+    def apkBaseName = apkFileName.replace('.apk', '')
+    
+    // 尝试新格式: apkInfo_{APK文件名去掉.apk}.json
+    // 例如: apkInfo_XbhKeyguard_xbh5_5.2.309_1315e3027d.json
+    def newFormatPath = "${apkDir}/apkInfo_${apkBaseName}.json"
+    
+    echo "查找 apkinfo.json 文件..."
+    echo "  APK 路径: ${apkFilePath}"
+    echo "  APK 目录: ${apkDir}"
+    echo "  尝试新格式: ${newFormatPath}"
+    
+    if (fileExists(newFormatPath)) {
+        echo "找到 apkinfo.json 文件 (新格式): ${newFormatPath}"
+        return newFormatPath
+    }
+    
+    // 尝试旧格式: apkinfo.{APK文件名}.json
+    def oldFormatPath = "${apkDir}/apkinfo.${apkFileName}.json"
+    echo "  尝试旧格式: ${oldFormatPath}"
+    
+    if (fileExists(oldFormatPath)) {
+        echo "找到 apkinfo.json 文件 (旧格式): ${oldFormatPath}"
+        return oldFormatPath
+    }
+    
+    // 尝试在整个 out 目录下搜索匹配的文件
+    echo "  在 out 目录下搜索: apkInfo_${apkBaseName}.json"
+    def searchResult = sh(
+        script: "find out/ -type f -name 'apkInfo_${apkBaseName}.json' 2>/dev/null | head -1",
+        returnStdout: true
+    ).trim()
+    
+    if (searchResult) {
+        echo "通过搜索找到 apkinfo.json 文件: ${searchResult}"
+        return searchResult
+    }
+    
+    // 尝试搜索旧格式
+    echo "  在 out 目录下搜索: apkinfo.${apkFileName}.json"
+    def searchResult2 = sh(
+        script: "find out/ -type f -name 'apkinfo.${apkFileName}.json' 2>/dev/null | head -1",
+        returnStdout: true
+    ).trim()
+    
+    if (searchResult2) {
+        echo "通过搜索找到 apkinfo.json 文件: ${searchResult2}"
+        return searchResult2
+    }
+    
+    echo "未找到 apkinfo.json 文件"
+    return null
+}
+
+// ========== Gradle构建函数 ==========
+
+def gradleBuild(flavor, buildType) {
+    sh """
+    # 设置Java环境
+    export JAVA_HOME=${env.COMPILE_JAVA_HOME}
+    export PATH="${env.COMPILE_JAVA_HOME}/bin:\$PATH"
+    rm -rf out/
+    JAVA_HOME=${env.COMPILE_JAVA_HOME}
+    if [ "${flavor}" == "all" ]; then
+        ${env.GRADLE_SCRIPT} clean assembleRelease --stacktrace
+    else
+        ${env.GRADLE_SCRIPT} clean assemble${flavor}${buildType} --stacktrace
+    fi
+    """
+}
