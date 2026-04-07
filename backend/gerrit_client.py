@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from config import settings
+
 logger = logging.getLogger("ones-ai.gerrit")
 
 
@@ -49,22 +51,30 @@ class GerritConfig:
     password: str   # HTTP Token 或 HTTP 密码
 
 
-# 预定义的 Gerrit 实例
-GERRIT_INSTANCES = [
-    GerritConfig(
-        name="Gerrit-182",
-        base_url="http://192.168.1.182:8081",
-        username="huangyixiang",
-        password="Mlj3rOox8fMHcVtmfGn2gAqzEdOAgApyGEeSVqltqw",
-    ),
-    # 194 暂不可用（Apache 反代 /a/ 路径 404）
-    # GerritConfig(
-    #     name="Gerrit-194",
-    #     base_url="http://192.168.1.194:8092",
-    #     username="huangyixiang",
-    #     password="nRKgzhPhL5XWqlzLlAN7ZFsqfXDW1WXWnSy3MnVbFw",
-    # ),
-]
+# 根据配置动态生成 Gerrit 实例列表
+def _build_gerrit_instances():
+    instances = []
+    # 实例1：从 settings 读取，有默认值兜底
+    host1 = settings.GERRIT_HOST_1 if settings.GERRIT_HOST_1 != "__GERRIT_HOST_1__" else "http://192.168.1.182:8081"
+    user1 = settings.GERRIT_USER_1 if settings.GERRIT_USER_1 != "__GERRIT_USER_1__" else "huangyixiang"
+    pass1 = settings.GERRIT_PASS_1 if settings.GERRIT_PASS_1 != "__GERRIT_PASS_1__" else "Mlj3rOox8fMHcVtmfGn2gAqzEdOAgApyGEeSVqltqw"
+    if host1:
+        instances.append(GerritConfig(name="Gerrit-182", base_url=host1, username=user1, password=pass1))
+    # 实例2
+    if settings.GERRIT_HOST_2 and settings.GERRIT_HOST_2 != "__GERRIT_HOST_2__":
+        instances.append(GerritConfig(
+            name="Gerrit-2", base_url=settings.GERRIT_HOST_2,
+            username=settings.GERRIT_USER_2, password=settings.GERRIT_PASS_2,
+        ))
+    # 实例3
+    if settings.GERRIT_HOST_3 and settings.GERRIT_HOST_3 != "__GERRIT_HOST_3__":
+        instances.append(GerritConfig(
+            name="Gerrit-3", base_url=settings.GERRIT_HOST_3,
+            username=settings.GERRIT_USER_3, password=settings.GERRIT_PASS_3,
+        ))
+    return instances
+
+GERRIT_INSTANCES = _build_gerrit_instances()
 
 
 class GerritClient:

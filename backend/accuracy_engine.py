@@ -4,24 +4,31 @@
 @Version: 1.0.0
 @Date: 2026-03-30
 
-五维度评分体系：
+五维度评分体系（v2 优化版）：
   1. 文件定位准确度 (0-20)
   2. 根因定位 (0-20)
-  3. 修复方案相似度 (0-25)
+  3. 修复方案相似度 (0-25) — 含 LLM 语义对比
   4. 可操作性 (0-15)
   5. 整体一致性 (0-20)
 
 总分 100 分，≥ 40 分视为"有效"（对开发有实质帮助）
+
+评分等级映射:
+  ≥ 75 分 → 完全一致 (10分/1分)
+  40-74 分 → 思路相近 (7分/0.7分)
+  < 40 分 → 无效 (0分)
 """
 
 import asyncio
 import json
 import logging
 import re
+import aiohttp
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
+from config import settings
 from gerrit_client import GerritClient, GerritChange, GerritConfig, GERRIT_INSTANCES
 
 logger = logging.getLogger("ones-ai.accuracy")
@@ -98,19 +105,42 @@ def extract_function_names(text: str) -> set:
     ]
 
     funcs = set()
-    # 排除常见关键词
+    # 排除常见关键词（扩充 Android/Java/C++ SDK 常见API）
     keywords = {
+        # 语言关键字
         'if', 'else', 'for', 'while', 'switch', 'case', 'return', 'void',
         'int', 'string', 'boolean', 'class', 'public', 'private', 'static',
         'import', 'package', 'new', 'try', 'catch', 'throw', 'null', 'true',
         'false', 'this', 'super', 'final', 'abstract', 'extends', 'implements',
         'sizeof', 'typedef', 'struct', 'enum', 'const', 'include', 'define',
-        'Log', 'println', 'print', 'printf', 'fprintf', 'sprintf',
+        'virtual', 'override', 'inline', 'extern', 'volatile', 'register',
+        'namespace', 'template', 'typename', 'using', 'auto', 'break',
+        'continue', 'default', 'goto', 'signed', 'unsigned', 'long', 'short',
+        'float', 'double', 'char', 'bool', 'interface', 'protected',
+        # 常见 API / 框架方法 — 不具备定位价值
+        'Log', 'println', 'print', 'printf', 'fprintf', 'sprintf', 'snprintf',
+        'System', 'String', 'Integer', 'Object', 'Arrays', 'Collections',
+        'List', 'Map', 'Set', 'HashMap', 'ArrayList', 'HashSet',
+        'IOException', 'Exception', 'RuntimeException', 'NullPointerException',
+        'assertEquals', 'assertTrue', 'assertFalse', 'assertNotNull',
+        'Intent', 'Bundle', 'Context', 'Activity', 'Fragment', 'View',
+        'TextView', 'ImageView', 'Button', 'LinearLayout', 'RelativeLayout',
+        'Toast', 'Dialog', 'AlertDialog', 'SharedPreferences', 'Handler',
+        'Looper', 'Thread', 'Runnable', 'AsyncTask', 'LayoutInflater',
+        'RecyclerView', 'Adapter', 'ViewHolder', 'ViewModel', 'LiveData',
+        'Application', 'Service', 'BroadcastReceiver', 'ContentProvider',
+        'Cursor', 'ContentValues', 'SQLiteDatabase', 'ContentResolver',
+        'MotionEvent', 'KeyEvent', 'GestureDetector', 'Drawable', 'Canvas',
+        'Paint', 'Bitmap', 'Matrix', 'Rect', 'Point', 'Color',
+        'malloc', 'calloc', 'realloc', 'free', 'memset', 'memcpy', 'memmove',
+        'strlen', 'strcmp', 'strcpy', 'strncpy', 'strcat', 'strncat',
+        'fopen', 'fclose', 'fread', 'fwrite', 'fseek', 'ftell',
+        'assert', 'exit', 'abort', 'signal', 'raise',
     }
     for pattern in patterns:
         for match in re.finditer(pattern, text):
             name = match.group(1)
-            if name not in keywords and not name.isupper():
+            if name not in keywords and not name.isupper() and len(name) > 2:
                 funcs.add(name)
     return funcs
 
@@ -180,7 +210,7 @@ def score_file_match(ai_files: set, gerrit_files: set) -> int:
 def score_root_cause(ai_funcs: set, gerrit_funcs: set) -> int:
     """维度二：根因定位 (0-20)"""
     if not gerrit_funcs:
-        return 5  # Gerrit 无函数信息，给基础分
+        return 0  # Gerrit 无函数信息，无法评分
     if not ai_funcs:
         return 0
 
@@ -191,8 +221,10 @@ def score_root_cause(ai_funcs: set, gerrit_funcs: set) -> int:
             return 20
         elif rate >= 0.3:
             return 15
-        else:
+        elif rate >= 0.1:
             return 10
+        else:
+            return 5
     return 0
 
 
@@ -376,43 +408,47 @@ class AccuracyEngine:
         return changes[0]
 
     async def _score_fix_similarity(self, ai_text: str, change: GerritChange, title: str) -> int:
-        """维度三：修复方案相似度 (0-25) — 基于规则"""
+        """维度三：修复方案相似度 (0-25) — 规则 + LLM 语义"""
         ai_code_blocks = extract_code_blocks(ai_text)
         gerrit_files = list(change.files.keys())
 
-        score = 0
+        # ---- 规则部分 (最高 10 分) ----
+        rule_score = 0
 
-        # 有代码建议
         if ai_code_blocks:
-            score += 10
+            rule_score += 3  # 有代码建议基础分
 
-            # 代码中是否提及了 Gerrit 修改的文件
             code_text = "\n".join(ai_code_blocks)
+            # 代码提及 Gerrit 修改文件
             for gf in gerrit_files:
                 basename = gf.split("/")[-1]
                 if basename in code_text or basename in ai_text:
-                    score += 5
+                    rule_score += 3
                     break
 
-            # 代码中是否提及了类似的函数/变量
+            # 函数名重叠
             ai_code_funcs = extract_function_names(code_text)
             gerrit_msg_funcs = extract_function_names(change.commit_message or change.subject)
             if ai_code_funcs & gerrit_msg_funcs:
-                score += 5
+                rule_score += 2
 
-            # 修改方向一致性（增/删）
+            # 增删方向一致
             if change.insertions > change.deletions:
                 if any(kw in ai_text for kw in ["新增", "添加", "增加", "add", "insert"]):
-                    score += 5
+                    rule_score += 2
             elif change.deletions > change.insertions:
                 if any(kw in ai_text for kw in ["删除", "移除", "remove", "delete"]):
-                    score += 5
+                    rule_score += 2
         else:
-            # 没有代码块但有分析
             if len(ai_text) > 500:
-                score += 5
+                rule_score += 2
 
-        return min(score, 25)
+        rule_score = min(rule_score, 10)
+
+        # ---- LLM 语义对比部分 (最高 15 分) ----
+        llm_score = await self._llm_compare_fix(ai_text, change, title)
+
+        return min(rule_score + llm_score, 25)
 
     def _score_consistency(self, title: str, ai_conclusion: str, gerrit_subject: str) -> int:
         """维度五：整体一致性 (0-20) — 基于关键词重叠"""
@@ -457,6 +493,89 @@ class AccuracyEngine:
         elif best_overlap > 0:
             return 5
         return 0
+
+    async def _llm_compare_fix(self, ai_text: str, change: GerritChange, title: str) -> int:
+        """用 LLM 对比 AI 报告与 Gerrit 实际修复的语义相似度 (0-15)"""
+        if not settings.AI_API_KEY or not settings.AI_BASE_URL:
+            logger.debug("未配置 AI API，跳过 LLM 评分")
+            return 0
+
+        # 截断避免 token 爆掉
+        ai_summary = ai_text[:2000]
+        gerrit_info = f"""Gerrit Change: {change.subject}
+Commit Message: {(change.commit_message or '')[:500]}
+Modified Files: {', '.join(list(change.files.keys())[:10])}
+Changes: +{change.insertions}/-{change.deletions}"""
+
+        prompt = f"""你是代码审查专家。请对比以下两份内容，判断 AI 分析报告与开发者实际修复的相似程度。
+
+## 工单标题
+{title}
+
+## AI 分析报告（摘要）
+{ai_summary}
+
+## 开发者实际修复（Gerrit 提交）
+{gerrit_info}
+
+请只回答一个 JSON，格式如下（不要其他内容）：
+{{"score": 0-15, "level": "完全一致|思路相近|部分相关|无关", "reason": "一句话理由"}}
+
+评分标准：
+- 13-15: AI 建议的修复方案与实际提交语义高度一致（核心逻辑相同）
+- 9-12: 修复方向正确，思路相同但细节不同
+- 5-8: 有部分参考价值，分析了正确的问题域
+- 1-4: 给出了分析但方向有偏差
+- 0: 完全无关或无实质内容"""
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                headers = {
+                    "Authorization": f"Bearer {settings.AI_API_KEY}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": settings.AI_SONNET_MODEL,
+                    "max_tokens": 200,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                async with session.post(
+                    f"{settings.AI_BASE_URL}/v1/messages",
+                    headers=headers,
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"LLM 评分请求失败: {resp.status}")
+                        return 0
+                    data = await resp.json()
+
+                # 解析返回
+                content = ""
+                if "content" in data and data["content"]:
+                    content = data["content"][0].get("text", "")
+                elif "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "")
+
+                # 从返回中提取 JSON
+                json_match = re.search(r'\{[^}]+\}', content)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    score = min(max(int(result.get("score", 0)), 0), 15)
+                    reason = result.get("reason", "")
+                    level = result.get("level", "")
+                    logger.info(f"LLM 评分: {score}/15 [{level}] {reason}")
+                    return score
+                else:
+                    logger.warning(f"LLM 返回格式异常: {content[:200]}")
+                    return 0
+
+        except asyncio.TimeoutError:
+            logger.warning("LLM 评分超时")
+            return 0
+        except Exception as e:
+            logger.warning(f"LLM 评分异常: {e}")
+            return 0
 
     async def save_result(self, result: EvalResult):
         """保存评测结果到数据库"""
