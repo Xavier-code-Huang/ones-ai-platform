@@ -441,6 +441,7 @@ async function triggerPreview(ticket, idx) {
       if (r.suggested_prompt) {
         ticket.note = r.suggested_prompt
         ticket._aiGenerated = true
+        ticket._suggestedAgent = r.suggested_agent || ''
         ElMessage.success(`工单 ${ticket.ticket_id} 已生成 AI 提示词`)
       } else if (r.error) {
         ElMessage.warning(`预分析: ${r.error}`)

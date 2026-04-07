@@ -48,33 +48,27 @@ class GerritConfig:
     name: str
     base_url: str
     username: str
-    password: str   # HTTP Token 或 HTTP 密码
+    password: str       # HTTP Token 或 HTTP 密码
+    api_prefix: str = "/a"  # Gerrit REST API 前缀，某些实例不需要 /a
 
 
-# 根据配置动态生成 Gerrit 实例列表
-def _build_gerrit_instances():
-    instances = []
-    # 实例1：从 settings 读取，有默认值兜底
-    host1 = settings.GERRIT_HOST_1 if settings.GERRIT_HOST_1 != "__GERRIT_HOST_1__" else "http://192.168.1.182:8081"
-    user1 = settings.GERRIT_USER_1 if settings.GERRIT_USER_1 != "__GERRIT_USER_1__" else "huangyixiang"
-    pass1 = settings.GERRIT_PASS_1 if settings.GERRIT_PASS_1 != "__GERRIT_PASS_1__" else "Mlj3rOox8fMHcVtmfGn2gAqzEdOAgApyGEeSVqltqw"
-    if host1:
-        instances.append(GerritConfig(name="Gerrit-182", base_url=host1, username=user1, password=pass1))
-    # 实例2
-    if settings.GERRIT_HOST_2 and settings.GERRIT_HOST_2 != "__GERRIT_HOST_2__":
-        instances.append(GerritConfig(
-            name="Gerrit-2", base_url=settings.GERRIT_HOST_2,
-            username=settings.GERRIT_USER_2, password=settings.GERRIT_PASS_2,
-        ))
-    # 实例3
-    if settings.GERRIT_HOST_3 and settings.GERRIT_HOST_3 != "__GERRIT_HOST_3__":
-        instances.append(GerritConfig(
-            name="Gerrit-3", base_url=settings.GERRIT_HOST_3,
-            username=settings.GERRIT_USER_3, password=settings.GERRIT_PASS_3,
-        ))
-    return instances
-
-GERRIT_INSTANCES = _build_gerrit_instances()
+# 硬编码 Gerrit 实例（避免 .env 覆盖出错）
+GERRIT_INSTANCES = [
+    GerritConfig(
+        name="Gerrit-182",
+        base_url="http://192.168.1.182:8081",
+        username="huangyixiang",
+        password="Mlj3rOox8fMHcVtmfGn2gAqzEdOAgApyGEeSVqltqw",
+        api_prefix="/a",
+    ),
+    GerritConfig(
+        name="Gerrit-194",
+        base_url="http://192.168.1.194:8092",
+        username="huangyixiang",
+        password="nRKgzhPhL5XWqlzLlAN7ZFsqfXDW1WXWnSy3MnVbFw",
+        api_prefix="",  # 194 不用 /a 前缀
+    ),
+]
 
 
 class GerritClient:
@@ -90,6 +84,7 @@ class GerritClient:
     def __init__(self, config: GerritConfig):
         self.config = config
         self.base_url = config.base_url.rstrip("/")
+        self.api_prefix = config.api_prefix
         self.auth = aiohttp.BasicAuth(config.username, config.password)
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -110,7 +105,7 @@ class GerritClient:
     async def _get(self, path: str, params: dict = None) -> any:
         """发起 GET 请求，自动处理 Gerrit XSSI 前缀"""
         session = await self._get_session()
-        url = f"{self.base_url}/a{path}"
+        url = f"{self.base_url}{self.api_prefix}{path}"
         try:
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
@@ -183,7 +178,7 @@ class GerritClient:
     async def get_patch(self, change_number: int) -> str:
         """获取 Change 的完整 patch (base64 encoded)"""
         session = await self._get_session()
-        url = f"{self.base_url}/a/changes/{change_number}/revisions/current/patch"
+        url = f"{self.base_url}{self.api_prefix}/changes/{change_number}/revisions/current/patch"
         try:
             async with session.get(url) as resp:
                 if resp.status != 200:

@@ -47,25 +47,37 @@ class PreviewResult(BaseModel):
     description: str = ""
     problem_type: str = ""
     suggested_prompt: str = ""
+    suggested_agent: str = ""
     error: str = ""
 
 
 # ---- AI 调用 ----
 
-PREVIEW_SYSTEM_PROMPT = """你是一个资深 Android/系统级代码缺陷分析专家。
-你将收到 ONES 工单信息和代码目录结构，请分析问题并生成一段精准的 AI 修复提示词。
+PREVIEW_SYSTEM_PROMPT = """你是一个资深 Android/嵌入式系统代码缺陷分析专家。你将收到 ONES 工单信息和代码目录结构，请分析问题并生成一段结构化的中文 AI 修复提示词。
 
-要求：
-1. 分析工单标题和描述，判断问题类型（bug/性能/兼容性/功能/其他）
-2. 结合代码目录结构（如有），推断可能涉及的模块和文件
-3. 生成 100-300 字的提示词，要求：
-   - 清晰描述问题现象
-   - 指出可能的根因方向
-   - 给出修复思路建议
-   - 如果能推断涉及文件，列出可能的修改文件路径
+【输出规则】
+1. 必须使用中文输出
+2. 严格按照下方 JSON 格式返回（不要包含 markdown 代码块标记）
+3. prompt 字段必须包含以下结构化内容，用换行分隔各部分
 
-请严格返回以下 JSON 格式（不要包含 markdown 代码块标记）：
-{"type": "问题类型", "prompt": "推荐提示词"}"""
+【prompt 字段格式要求】
+```
+## 问题现象
+（用2-3句话精确描述问题的外在表现，包括触发条件、影响范围）
+
+## 根因分析方向
+（列出2-3个可能的根因方向，每个方向用 - 开头，要具体到模块和机制层面）
+
+## 修复建议
+（给出具体的修复思路，包含需要关注的关键代码模块或类名）
+
+## 涉及文件（推测）
+（列出可能需要修改的文件路径，用 - 开头，每行一个）
+```
+
+请严格返回以下 JSON 格式：
+{"type": "问题分类(bug/性能/兼容性/UI/功能/安全/其他)", "prompt": "按上述格式生成的结构化提示词"}"""
+
 
 
 async def _call_ai(user_prompt: str) -> dict:
@@ -114,6 +126,7 @@ async def _call_ai(user_prompt: str) -> dict:
                     return {
                         "type": result.get("type", ""),
                         "prompt": result.get("prompt", ""),
+                        "agent": result.get("agent", ""),
                     }
                 except json.JSONDecodeError:
                     # AI 未返回有效 JSON，将原始文本作为提示词
@@ -273,6 +286,7 @@ async def preview_tickets(
             description=desc[:500],
             problem_type=ai_result.get("type", ""),
             suggested_prompt=ai_result.get("prompt", ""),
+            suggested_agent=ai_result.get("agent", ""),
         ))
 
     return results

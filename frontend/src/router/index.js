@@ -14,6 +14,7 @@ const routes = [
   { path: '/admin/configs', name: 'AdminConfigs', component: () => import('../views/AdminConfigs.vue'), meta: { auth: true, admin: true } },
   { path: '/admin/servers', name: 'AdminServers', component: () => import('../views/AdminServers.vue'), meta: { auth: true, admin: true } },
   { path: '/admin/external', name: 'AdminExternalTeams', component: () => import('../views/AdminExternalTeams.vue'), meta: { auth: true, admin: true } },
+  { path: '/admin/accuracy', name: 'AccuracyEval', component: () => import('../views/AccuracyView.vue'), meta: { auth: true, admin: true } },
 ]
 
 const router = createRouter({ history: createWebHistory(), routes })

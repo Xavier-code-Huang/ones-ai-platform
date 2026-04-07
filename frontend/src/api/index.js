@@ -71,4 +71,8 @@ export default {
   getExternalTeamStats: (id, days) => api.get(`/admin/external-teams/${id}/stats`, { params: { days } }),
   getMemberLogs: (teamId, memberName, days) => api.get(`/admin/external-teams/${teamId}/members/${encodeURIComponent(memberName)}/logs`, { params: { days } }),
   getExternalOverview: (days) => api.get('/admin/external-overview', { params: { days } }),
+  // Accuracy Evaluation
+  getAccuracySummary: () => api.get('/accuracy/summary'),
+  getAccuracyTickets: (page, pageSize, effectiveOnly) => api.get('/accuracy/tickets', { params: { page, page_size: pageSize, effective_only: effectiveOnly || undefined } }),
+  batchAccuracyEval: (limit) => api.post('/accuracy/batch', null, { params: { limit }, timeout: 600000 }),
 }

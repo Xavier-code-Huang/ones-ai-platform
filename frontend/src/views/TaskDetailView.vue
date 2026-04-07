@@ -131,28 +131,28 @@
                 </div>
                 <!-- 容器控制按钮 -->
                 <div v-if="['running', 'completed', 'failed', 'cancelled'].includes(task.status)" class="container-controls" style="margin-left:auto;">
-                  <!-- 场景A: 任务执行中，但还没拿到容器名 -->
-                  <el-button v-if="task.status === 'running' && !currentContainerName" size="small" type="info" round disabled>
+                  <!-- 场景A: 当前工单正在执行中，但还没拿到容器名 -->
+                  <el-button v-if="selectedTicket?.status === 'running' && !currentContainerName" size="small" type="info" round disabled>
                     ⏳ 容器准备中
                   </el-button>
-                  <!-- 场景B: 任务执行中，且已拿到任务容器名 (观测模式) -->
-                  <el-button v-else-if="task.status === 'running' && currentContainerName" size="small" type="primary" round @click="toggleTerminal">
+                  <!-- 场景B: 当前工单正在执行中，且已拿到容器名 (观测模式) -->
+                  <el-button v-else-if="selectedTicket?.status === 'running' && currentContainerName" size="small" type="primary" round @click="toggleTerminal">
                     🖥️ {{ showTerminal ? '收起终端' : '观测容器' }}
                   </el-button>
-                  <!-- 场景C: 任务已结束 → 历史回放按钮 -->
-                  <el-button v-else-if="task.status !== 'running'" size="small" :type="showTerminal ? 'info' : 'primary'" round @click="toggleReplay" :loading="replayLoading">
+                  <!-- 场景C: 当前工单已结束 → 历史回放按钮 -->
+                  <el-button v-else-if="isTicketDone" size="small" :type="showTerminal ? 'info' : 'primary'" round @click="toggleReplay" :loading="replayLoading">
                     📼 {{ showTerminal ? '收起回放' : '历史回放' }}
                   </el-button>
-                  <!-- 场景D: 唤醒干预环境（移到回放按钮旁边） -->
-                  <el-button v-if="task.status !== 'running' && !isInterveneContainer && !showTerminal" size="small" type="warning" round @click="startContainer" :loading="startingContainer" style="margin-left:6px;">
+                  <!-- 场景D: 当前工单已结束，唤醒干预环境 -->
+                  <el-button v-if="isTicketDone && !isInterveneContainer && !showTerminal" size="small" type="warning" round @click="startContainer" :loading="startingContainer" style="margin-left:6px;">
                     📦 唤醒干预
                   </el-button>
                   <!-- 场景E: 有干预容器正在运行 -->
-                  <el-button v-if="task.status !== 'running' && isInterveneContainer && containerStatus === 'running'" size="small" type="success" round @click="toggleTerminal" style="margin-left:6px;">
+                  <el-button v-if="isTicketDone && isInterveneContainer && containerStatus === 'running'" size="small" type="success" round @click="toggleTerminal" style="margin-left:6px;">
                     ⌨️ {{ showTerminal && terminalMode === 'live' ? '收起干预' : '进入干预' }}
                   </el-button>
                   <!-- 场景F: 有干预容器但休眠 -->
-                  <el-button v-if="task.status !== 'running' && isInterveneContainer && containerStatus !== 'running'" size="small" type="warning" round @click="startContainer" :loading="startingContainer" style="margin-left:6px;">
+                  <el-button v-if="isTicketDone && isInterveneContainer && containerStatus !== 'running'" size="small" type="warning" round @click="startContainer" :loading="startingContainer" style="margin-left:6px;">
                     ⚡ 恢复干预
                   </el-button>
                 </div>
@@ -317,8 +317,10 @@ let _unmounted = false
 // Web Terminal 控制
 const showTerminal = ref(false)
 const containerStatus = ref(null) // running, exited, not_bound, not_found, error
-const currentContainerName = ref('')
+const containerNameMap = ref({}) // { ticketDbId: containerName }
+const currentContainerName = computed(() => containerNameMap.value[selectedTicketId.value] || '')
 const isInterveneContainer = computed(() => currentContainerName.value.includes('intervene'))
+const isTicketDone = computed(() => ['completed', 'failed', 'cancelled'].includes(selectedTicket.value?.status))
 const startingContainer = ref(false)
 const webTerminalRef = ref(null)
 
@@ -400,9 +402,10 @@ async function fetchContainerStatus(ticketDbId) {
   try {
     const res = await api.getContainerStatus(route.params.id, ticketDbId)
     containerStatus.value = res.status
-    currentContainerName.value = res.container_name || ''
+    if (res.container_name) {
+      containerNameMap.value = { ...containerNameMap.value, [ticketDbId]: res.container_name }
+    }
     if (res.status === 'running') {
-      // 若是正在执行的任务且刚选中工单默认打开终端的话可在此配置
       if (task.value.status === 'running' && !showTerminal.value && !isInterveneContainer.value) {
         showTerminal.value = true
       }
@@ -446,6 +449,7 @@ async function startContainer() {
     // 刷新容器状态并打开终端
     containerStatus.value = 'running'
     showTerminal.value = true
+    terminalMode.value = 'live'
     // 重新获取容器状态以更新容器名
     await fetchContainerStatus(selectedTicketId.value)
   } catch (e) {
@@ -568,8 +572,15 @@ function connectWs() {
       ticketPhasesMap.value[msg.ticket_db_id] = msg.phases || []
       ticketPhasesMap.value = { ...ticketPhasesMap.value }
     } else if (msg.type === 'container_bound') {
+      // 无条件存入 map，确保多工单场景下容器名不丢失
+      containerNameMap.value = { ...containerNameMap.value, [msg.ticket_db_id]: msg.container_name }
+      // 自动切到正在执行的工单
+      const runningTicket = (task.value.tickets || []).find(t => t.status === 'running')
+      if (runningTicket && selectedTicketId.value !== runningTicket.id) {
+        selectedTicketId.value = runningTicket.id
+      }
+      // 如果是当前选中的工单，更新状态并打开终端
       if (msg.ticket_db_id === selectedTicketId.value) {
-        currentContainerName.value = msg.container_name
         containerStatus.value = 'running'
         if (!showTerminal.value && !isInterveneContainer.value) {
           showTerminal.value = true

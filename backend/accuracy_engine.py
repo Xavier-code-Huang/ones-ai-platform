@@ -92,6 +92,25 @@ def extract_file_paths(text: str) -> set:
     return files
 
 
+def extract_diff_function_names(diff_text: str) -> set:
+    """从 Gerrit diff 的 @@ 行提取函数名（更精准）"""
+    if not diff_text:
+        return set()
+    # @@ -a,b +c,d @@ functionName  或  @@ -a,b +c,d @@ ReturnType functionName(
+    funcs = set()
+    for match in re.finditer(r'@@\s*-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@\s*(.+)', diff_text):
+        ctx = match.group(1).strip()
+        # 尝试提取最后一个 word( 形式
+        fn_match = re.search(r'\b([a-zA-Z_]\w{2,})\s*\(', ctx)
+        if fn_match:
+            funcs.add(fn_match.group(1))
+        elif ctx and not ctx.startswith('#') and not ctx.startswith('//'):
+            # 可能是类名或宏
+            words = re.findall(r'\b([a-zA-Z_]\w{3,})\b', ctx)
+            funcs.update(words)
+    return funcs
+
+
 def extract_function_names(text: str) -> set:
     """从文本中提取函数/方法名"""
     if not text:
@@ -207,24 +226,43 @@ def score_file_match(ai_files: set, gerrit_files: set) -> int:
         return 5
 
 
-def score_root_cause(ai_funcs: set, gerrit_funcs: set) -> int:
-    """维度二：根因定位 (0-20)"""
+def score_root_cause(ai_funcs: set, gerrit_funcs: set, ai_files: set = None, gerrit_files: set = None) -> int:
+    """维度二：根因定位 (0-20)
+    优化：当 Gerrit diff 无函数名时，用文件覆盖率做降级评分
+    """
+    # 主评分：函数名匹配
+    if gerrit_funcs and ai_funcs:
+        intersection = ai_funcs & gerrit_funcs
+        if intersection:
+            rate = len(intersection) / len(gerrit_funcs)
+            if rate >= 0.5:
+                return 20
+            elif rate >= 0.3:
+                return 15
+            elif rate >= 0.1:
+                return 10
+            else:
+                return 5
+
+    # 降级评分：Gerrit diff 无函数名（commit message 纯标题），用文件覆盖替代
     if not gerrit_funcs:
-        return 0  # Gerrit 无函数信息，无法评分
-    if not ai_funcs:
+        if ai_files and gerrit_files:
+            ai_basenames = {f.split('/')[-1] for f in ai_files}
+            gerrit_basenames = {f.split('/')[-1] for f in gerrit_files}
+            overlap = ai_basenames & gerrit_basenames
+            if overlap:
+                rate = len(overlap) / len(gerrit_basenames)
+                if rate >= 0.6:
+                    return 10  # 文件高覆盖 → 根因基本正确
+                elif rate >= 0.3:
+                    return 7
+                else:
+                    return 3
+        # AI 有分析但 Gerrit 无函数信息，给最低基础分
+        if ai_funcs:
+            return 3
         return 0
 
-    intersection = ai_funcs & gerrit_funcs
-    if intersection:
-        rate = len(intersection) / len(gerrit_funcs)
-        if rate >= 0.5:
-            return 20
-        elif rate >= 0.3:
-            return 15
-        elif rate >= 0.1:
-            return 10
-        else:
-            return 5
     return 0
 
 
@@ -333,15 +371,20 @@ class AccuracyEngine:
         gerrit_files_set = set(best_change.files.keys())
         result.score_file_match = score_file_match(ai_files, gerrit_files_set)
 
-        # 维度二：根因定位
+        # 维度二：根因定位（优化：先从 diff @@ 行提取精准函数名）
         ai_funcs = extract_function_names(full_ai_text)
-        # 从 Gerrit patch 获取函数名（如果有 diff）
         gerrit_funcs = set()
         if best_change.diff_content:
-            gerrit_funcs = extract_function_names(best_change.diff_content)
-        elif best_change.commit_message:
+            # 优先从 @@ 行提取（最精准）
+            gerrit_funcs = extract_diff_function_names(best_change.diff_content)
+            # 补充从 diff 全文提取
+            gerrit_funcs |= extract_function_names(best_change.diff_content)
+        if not gerrit_funcs and best_change.commit_message:
             gerrit_funcs = extract_function_names(best_change.commit_message)
-        result.score_root_cause = score_root_cause(ai_funcs, gerrit_funcs)
+        result.score_root_cause = score_root_cause(
+            ai_funcs, gerrit_funcs,
+            ai_files=ai_files, gerrit_files=gerrit_files_set
+        )
 
         # 维度三：方案相似度 — 先用基于规则的方法
         result.score_fix_similar = await self._score_fix_similarity(
@@ -353,7 +396,7 @@ class AccuracyEngine:
 
         # 维度五：整体一致性 — 工单标题 vs AI 结论 vs Gerrit subject
         result.score_consistency = self._score_consistency(
-            title, conclusion or summary, best_change.subject
+            title, conclusion or summary, best_change.subject, full_ai_text
         )
 
         # 汇总
@@ -450,45 +493,70 @@ class AccuracyEngine:
 
         return min(rule_score + llm_score, 25)
 
-    def _score_consistency(self, title: str, ai_conclusion: str, gerrit_subject: str) -> int:
-        """维度五：整体一致性 (0-20) — 基于关键词重叠"""
-        if not title and not gerrit_subject:
-            return 5
+    def _score_consistency(self, title: str, ai_conclusion: str, gerrit_subject: str, full_ai_text: str = "") -> int:
+        """维度五：整体一致性 (0-20) — 优化版
+        改进：无标题时用 AI 全文 vs Gerrit subject 对比
+        改进：关键词提取更精准，排除更多停用词
+        """
+        if not ai_conclusion and not full_ai_text:
+            return 0
 
-        # 提取中文和英文关键词
+        # 停用词
+        stopwords_cn = {'一个', '这个', '那个', '进行', '通过', '可以', '需要', '已经',
+                        '目前', '其中', '以及', '但是', '因为', '所以', '如果', '没有',
+                        '问题', '文件', '代码', '修改', '分析', '建议', '修复', '方案',
+                        '功能', '实现', '支持', '使用', '处理', '相关'}
+        stopwords_en = {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'have',
+                        'has', 'not', 'but', 'are', 'was', 'were', 'been', 'will',
+                        'can', 'should', 'would', 'could', 'also', 'may', 'into',
+                        'when', 'where', 'which', 'there', 'their', 'about', 'each',
+                        'make', 'like', 'than', 'then', 'more', 'some', 'other',
+                        'file', 'code', 'change', 'add', 'fix', 'update', 'bug',
+                        'new', 'set', 'get', 'use', 'null', 'void', 'int', 'return',
+                        'string', 'class', 'public', 'private', 'static', 'import'}
+
         def extract_keywords(text: str) -> set:
             if not text:
                 return set()
-            # 中文词（2字以上）
-            cn_words = set(re.findall(r'[\u4e00-\u9fa5]{2,4}', text))
-            # 英文词（3字符以上）
-            en_words = set(w.lower() for w in re.findall(r'[a-zA-Z]{3,}', text) 
-                          if w.lower() not in {'the', 'and', 'for', 'with', 'from', 'this', 'that'})
-            return cn_words | en_words
+            # 中文词（3字以上更精准）
+            cn_words = set(w for w in re.findall(r'[\u4e00-\u9fa5]{3,6}', text) if w not in stopwords_cn)
+            # 补充2字关键词（技术术语）
+            cn_words |= set(w for w in re.findall(r'[\u4e00-\u9fa5]{2}', text)
+                          if w not in stopwords_cn and any(c in w for c in '异常崩溃死机重启闪退卡顿泄漏溢出越界空指黑屏花屏'))
+            # 英文词
+            en_words = set(w.lower() for w in re.findall(r'[a-zA-Z]{3,}', text)
+                          if w.lower() not in stopwords_en)
+            # 技术缩写（NPE, OOM, ANR 等）
+            abbrevs = set(w for w in re.findall(r'\b[A-Z]{2,5}\b', text)
+                        if w not in {'NULL', 'TRUE', 'FALSE', 'VOID', 'INT', 'TODO', 'NOTE', 'ONES', 'STORY', 'BUG'})
+            return cn_words | en_words | abbrevs
+
+        # 有标题时用标题，无标题时用 AI 报告全文（取前500字）
+        ai_text_for_match = ai_conclusion
+        if not title and full_ai_text:
+            ai_text_for_match = full_ai_text[:500]
 
         title_kw = extract_keywords(title)
         gerrit_kw = extract_keywords(gerrit_subject)
-        ai_kw = extract_keywords(ai_conclusion)
+        ai_kw = extract_keywords(ai_text_for_match)
 
         # AI 结论与工单标题的重叠
+        overlap_title = 0
         if title_kw and ai_kw:
             overlap_title = len(title_kw & ai_kw) / max(len(title_kw), 1)
-        else:
-            overlap_title = 0
 
-        # AI 结论与 Gerrit subject 的重叠
+        # AI 结论/全文与 Gerrit subject 的重叠（核心改进）
+        overlap_gerrit = 0
         if gerrit_kw and ai_kw:
             overlap_gerrit = len(gerrit_kw & ai_kw) / max(len(gerrit_kw), 1)
-        else:
-            overlap_gerrit = 0
 
         best_overlap = max(overlap_title, overlap_gerrit)
 
-        if best_overlap >= 0.5:
+        if best_overlap >= 0.4:
             return 20
-        elif best_overlap >= 0.3:
+        elif best_overlap >= 0.25:
             return 15
-        elif best_overlap >= 0.15:
+        elif best_overlap >= 0.12:
             return 10
         elif best_overlap > 0:
             return 5
@@ -496,9 +564,10 @@ class AccuracyEngine:
 
     async def _llm_compare_fix(self, ai_text: str, change: GerritChange, title: str) -> int:
         """用 LLM 对比 AI 报告与 Gerrit 实际修复的语义相似度 (0-15)"""
-        if not settings.AI_API_KEY or not settings.AI_BASE_URL:
-            logger.debug("未配置 AI API，跳过 LLM 评分")
-            return 0
+        # Qwen3-235B 配置
+        LLM_BASE_URL = "http://115.190.54.79:8000/v1"
+        LLM_API_KEY = "qingtianjia"
+        LLM_MODEL = "Qwen3-235B-FP8"
 
         # 截断避免 token 爆掉
         ai_summary = ai_text[:2000]
@@ -529,24 +598,25 @@ Changes: +{change.insertions}/-{change.deletions}"""
 - 0: 完全无关或无实质内容"""
 
         try:
-            timeout = aiohttp.ClientTimeout(total=30)
+            timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 headers = {
-                    "Authorization": f"Bearer {settings.AI_API_KEY}",
+                    "Authorization": f"Bearer {LLM_API_KEY}",
                     "Content-Type": "application/json",
                 }
                 payload = {
-                    "model": settings.AI_SONNET_MODEL,
-                    "max_tokens": 200,
+                    "model": LLM_MODEL,
+                    "max_tokens": 300,
                     "messages": [{"role": "user", "content": prompt}],
                 }
                 async with session.post(
-                    f"{settings.AI_BASE_URL}/v1/messages",
+                    f"{LLM_BASE_URL}/chat/completions",
                     headers=headers,
                     json=payload,
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning(f"LLM 评分请求失败: {resp.status}")
+                        body = await resp.text()
+                        logger.warning(f"LLM 评分请求失败: {resp.status} {body[:200]}")
                         return 0
                     data = await resp.json()
 

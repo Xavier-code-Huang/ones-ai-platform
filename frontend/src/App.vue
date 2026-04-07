@@ -34,6 +34,9 @@
             <router-link to="/admin/eval" class="nav-item" :class="{ active: $route.path === '/admin/eval' }">
               <el-icon><Star /></el-icon> 评价分析
             </router-link>
+            <router-link to="/admin/accuracy" class="nav-item" :class="{ active: $route.path === '/admin/accuracy' }">
+              <el-icon><Aim /></el-icon> 准确度评测
+            </router-link>
             <router-link to="/admin/configs" class="nav-item" :class="{ active: $route.path === '/admin/configs' }">
               <el-icon><Setting /></el-icon> 服务配置
             </router-link>
