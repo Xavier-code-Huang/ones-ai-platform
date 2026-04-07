@@ -116,15 +116,19 @@
             <div ref="trendChartRef" style="height:220px;"></div>
           </div>
         </div>
-
         <!-- 成员明细 -->
         <div class="detail-section">
           <h4>成员使用明细</h4>
-          <el-table :data="detailData.members" border size="small" style="width:100%;">
-            <el-table-column prop="member_name" label="成员" width="160" />
-            <el-table-column prop="log_count" label="上报次数" width="100" sortable />
-            <el-table-column prop="success_count" label="成功次数" width="100" />
-            <el-table-column label="平均耗时" width="100">
+          <el-table :data="detailData.members" border size="small" style="width:100%;"
+                    @row-click="openMemberLogs" class="member-table">
+            <el-table-column prop="member_name" label="成员" min-width="140">
+              <template #default="{ row }">
+                <span class="member-link">{{ row.member_name }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="log_count" label="上报次数" min-width="100" sortable />
+            <el-table-column prop="success_count" label="成功" min-width="80" />
+            <el-table-column label="平均耗时" min-width="100">
               <template #default="{ row }">{{ row.avg_duration }}s</template>
             </el-table-column>
           </el-table>
@@ -143,14 +147,79 @@
         <el-button @click="showDetailDialog=false" round>关闭</el-button>
       </template>
     </el-dialog>
+
+    <!-- 成员日志弹框 -->
+    <el-dialog v-model="showMemberDialog" :title="memberDialogTitle" width="820px" append-to-body>
+      <div v-if="memberLogsLoading" style="text-align:center;padding:40px;">
+        <el-icon class="is-loading" :size="24"><Loading /></el-icon>
+        <p style="margin-top:8px;color:var(--text-muted);">加载中...</p>
+      </div>
+      <template v-else-if="memberLogs.length">
+        <!-- 成员统计概览 -->
+        <div class="member-dialog-stats">
+          <div class="member-mini-stat">
+            <span class="stat-number">{{ memberLogs.length }}</span>
+            <span class="stat-label">总记录</span>
+          </div>
+          <div class="member-mini-stat">
+            <span class="stat-number" style="color:var(--success);">{{ memberLogs.filter(l => l.status === 'completed').length }}</span>
+            <span class="stat-label">成功</span>
+          </div>
+          <div class="member-mini-stat">
+            <span class="stat-number" style="color:var(--danger);">{{ memberLogs.filter(l => l.status === 'failed').length }}</span>
+            <span class="stat-label">失败</span>
+          </div>
+          <div class="member-mini-stat">
+            <span class="stat-number">{{ memberAvgDuration }}s</span>
+            <span class="stat-label">平均耗时</span>
+          </div>
+        </div>
+        <!-- 日志表格 -->
+        <el-table :data="memberLogs" size="small" border style="width:100%;" max-height="420">
+          <el-table-column prop="ticket_id" label="工单号" width="130">
+            <template #default="{ row }">
+              <span v-if="row.ticket_id" class="mono-text">{{ row.ticket_id }}</span>
+              <span v-else class="text-muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="status" label="状态" width="80" align="center">
+            <template #default="{ row }">
+              <span :class="['status-dot-inline', row.status === 'completed' ? 'dot-success' : 'dot-danger']"></span>
+              {{ row.status === 'completed' ? '成功' : '失败' }}
+            </template>
+          </el-table-column>
+          <el-table-column prop="duration" label="耗时" width="80" align="right">
+            <template #default="{ row }">{{ row.duration }}s</template>
+          </el-table-column>
+          <el-table-column prop="summary" label="处理摘要" min-width="220">
+            <template #default="{ row }">
+              <span v-if="row.summary" style="font-size:0.82rem;line-height:1.5;">{{ row.summary }}</span>
+              <span v-else class="text-muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="reported_at" label="上报时间" width="150">
+            <template #default="{ row }">
+              <span class="text-muted" style="font-size:0.78rem;">{{ row.reported_at?.substring(0,16) }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <div v-else style="text-align:center;padding:40px;color:var(--text-muted);">
+        💭 该成员暂无上报记录
+      </div>
+      <template #footer>
+        <el-button @click="showMemberDialog=false" round>关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import api from '../api'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
+import { Loading } from '@element-plus/icons-vue'
 
 const teams = ref([])
 const loading = ref(false)
@@ -238,6 +307,34 @@ function copyKey() {
   ElMessage.success('已复制 API Key')
 }
 
+// 成员日志弹框
+const showMemberDialog = ref(false)
+const memberLogs = ref([])
+const memberLogsLoading = ref(false)
+const currentMemberName = ref('')
+
+const memberDialogTitle = computed(() => `📝 ${currentMemberName.value} — 详细记录`)
+const memberAvgDuration = computed(() => {
+  if (!memberLogs.value.length) return 0
+  const total = memberLogs.value.reduce((s, l) => s + (l.duration || 0), 0)
+  return (total / memberLogs.value.length).toFixed(1)
+})
+
+async function openMemberLogs(row) {
+  currentMemberName.value = row.member_name
+  memberLogs.value = []
+  memberLogsLoading.value = true
+  showMemberDialog.value = true
+  try {
+    const data = await api.getMemberLogs(detailTeam.value.id, row.member_name, detailDays.value)
+    memberLogs.value = data.logs || []
+  } catch (e) {
+    ElMessage.error('加载成员日志失败')
+  } finally {
+    memberLogsLoading.value = false
+  }
+}
+
 onMounted(loadTeams)
 </script>
 
@@ -304,4 +401,57 @@ onMounted(loadTeams)
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
 }
+
+.member-table :deep(.el-table__row) {
+  cursor: pointer;
+}
+.member-table :deep(.el-table__row:hover > td) {
+  background: rgba(59,130,246,0.06) !important;
+}
+.member-table :deep(.current-row > td) {
+  background: transparent !important;
+}
+
+.member-link {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 600;
+  transition: color 0.2s;
+}
+.member-link:hover {
+  color: var(--accent-dark, #1e40af);
+  text-decoration: underline;
+}
+
+/* 成员弹框内 */
+.member-dialog-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.member-mini-stat {
+  text-align: center;
+  padding: 12px 8px;
+  background: var(--bg-surface, #f8fafc);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border, #e2e8f0);
+}
+.mono-text {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.8rem;
+}
+.text-muted {
+  color: var(--text-muted, #94a3b8);
+  font-size: 0.82rem;
+}
+.status-dot-inline {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.dot-success { background: var(--success, #22c55e); }
+.dot-danger { background: var(--danger, #ef4444); }
 </style>

@@ -42,6 +42,7 @@ export default {
   getTask: (id) => api.get(`/tasks/${id}`),
   cancelTask: (id) => api.delete(`/tasks/${id}`),
   getTaskLogs: (id) => api.get(`/tasks/${id}/logs`),
+  getTicketTerminalLogs: (taskId, ticketDbId) => api.get(`/tasks/${taskId}/tickets/${ticketDbId}/terminal-logs`),
   getTicketReport: (taskId, ticketId) => api.get(`/tasks/${taskId}/tickets/${ticketId}/report`),
   reworkTicket: (taskId, ticketId, data) => api.post(`/tasks/${taskId}/tickets/${ticketId}/rework`, data),
   getTicketPhases: (taskId, ticketDbId) => api.get(`/tasks/${taskId}/tickets/${ticketDbId}/phases`),
@@ -49,6 +50,9 @@ export default {
   getCodePaths: (serverId) => api.get('/tasks/code-paths', { params: { server_id: serverId } }),
   deleteCodePath: (pathId) => api.delete(`/tasks/code-paths/${pathId}`),
   previewTickets: (data) => api.post('/tasks/preview', data),
+  // Containers
+  getContainerStatus: (taskId, ticketDbId) => api.get(`/tasks/${taskId}/tickets/${ticketDbId}/container`),
+  startContainer: (taskId, ticketDbId) => api.post(`/tasks/${taskId}/tickets/${ticketDbId}/container/start`),
   // Evaluations
   submitEval: (data) => api.post('/evaluations', data),
   // Admin
@@ -65,5 +69,6 @@ export default {
   createExternalTeam: (data) => api.post('/admin/external-teams', data),
   deleteExternalTeam: (id) => api.delete(`/admin/external-teams/${id}`),
   getExternalTeamStats: (id, days) => api.get(`/admin/external-teams/${id}/stats`, { params: { days } }),
+  getMemberLogs: (teamId, memberName, days) => api.get(`/admin/external-teams/${teamId}/members/${encodeURIComponent(memberName)}/logs`, { params: { days } }),
   getExternalOverview: (days) => api.get('/admin/external-overview', { params: { days } }),
 }

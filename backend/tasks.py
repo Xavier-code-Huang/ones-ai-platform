@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from auth import get_current_user, UserInfo
+from config import settings
 from database import get_pool
 
 logger = logging.getLogger("ones-ai.tasks")
@@ -309,6 +310,48 @@ async def list_tasks(
     ]
 
 
+@router.get("/code-paths")
+async def get_code_paths(
+    server_id: int = Query(..., description="服务器 ID"),
+    user: UserInfo = Depends(get_current_user),
+):
+    """获取用户在指定服务器上的历史代码路径 [FR-107]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, path, use_count, last_used_at
+            FROM user_code_paths
+            WHERE user_id=$1 AND server_id=$2
+            ORDER BY use_count DESC, last_used_at DESC
+            LIMIT 30
+        """, user.id, server_id)
+
+    return [
+        {
+            "id": r["id"],
+            "path": r["path"],
+            "use_count": r["use_count"],
+            "last_used_at": str(r["last_used_at"]) if r["last_used_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+@router.delete("/code-paths/{path_id}")
+async def delete_code_path(
+    path_id: int,
+    user: UserInfo = Depends(get_current_user),
+):
+    """删除历史代码路径 [FR-107]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM user_code_paths WHERE id=$1 AND user_id=$2",
+            path_id, user.id,
+        )
+    return {"message": "已删除"}
+
+
 class ReworkRequest(BaseModel):
     feedback: str
 
@@ -507,6 +550,43 @@ async def get_task_logs(
     }
 
 
+@router.get("/{task_id}/tickets/{ticket_db_id}/terminal-logs")
+async def get_ticket_terminal_logs(
+    task_id: int, ticket_db_id: int,
+    user: UserInfo = Depends(get_current_user),
+):
+    """获取单个工单的终端日志（用于历史回放）[FR-112]"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        task = await conn.fetchrow(
+            "SELECT user_id FROM tasks WHERE id=$1", task_id
+        )
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if task["user_id"] != user.id and user.role != "admin":
+            raise HTTPException(status_code=403, detail="无权限")
+
+        logs = await conn.fetch(
+            "SELECT content, log_type, phase_name, timestamp FROM task_logs "
+            "WHERE task_id=$1 AND (task_ticket_id=$2 OR task_ticket_id IS NULL) "
+            "ORDER BY id",
+            task_id, ticket_db_id,
+        )
+
+    return {
+        "task_id": task_id,
+        "ticket_db_id": ticket_db_id,
+        "logs": [
+            {
+                "content": log["content"],
+                "log_type": log["log_type"],
+                "timestamp": str(log["timestamp"]),
+            }
+            for log in logs
+        ],
+    }
+
+
 # ============================================================
 #  新增 API — 阶段查询 / 工单编辑 / 代码路径历史
 #  关联: FR-101, FR-107, FR-108
@@ -599,45 +679,284 @@ async def edit_pending_ticket(
     return {"message": "工单已更新", "ticket_db_id": ticket_db_id}
 
 
-@router.get("/code-paths")
-async def get_code_paths(
-    server_id: int = Query(..., description="服务器 ID"),
+
+# ============================================================
+#  容器管理 API
+# ============================================================
+
+from crypto import decrypt_password
+from ssh_pool import get_ssh_connection
+
+@router.get("/{task_id}/tickets/{ticket_db_id}/container")
+async def get_ticket_container(
+    task_id: int, ticket_db_id: int,
     user: UserInfo = Depends(get_current_user),
 ):
-    """获取用户在指定服务器上的历史代码路径 [FR-107]"""
+    """获取工单关联的容器信息及运行状态"""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, path, use_count, last_used_at
-            FROM user_code_paths
-            WHERE user_id=$1 AND server_id=$2
-            ORDER BY use_count DESC, last_used_at DESC
-            LIMIT 30
-        """, user.id, server_id)
+        record = await conn.fetchrow("""
+            SELECT tt.container_name, t.user_id,
+                   usc.ssh_username, usc.ssh_password_encrypted,
+                   s.host, s.ssh_port
+            FROM task_tickets tt
+            JOIN tasks t ON t.id = tt.task_id
+            JOIN user_server_credentials usc ON usc.id = t.credential_id
+            JOIN servers s ON s.id = t.server_id
+            WHERE tt.id = $1 AND tt.task_id = $2
+        """, ticket_db_id, task_id)
 
-    return [
-        {
-            "id": r["id"],
-            "path": r["path"],
-            "use_count": r["use_count"],
-            "last_used_at": str(r["last_used_at"]) if r["last_used_at"] else None,
-        }
-        for r in rows
-    ]
+    if not record:
+        raise HTTPException(404, "工单不存在")
+    if record["user_id"] != user.id and user.role != "admin":
+        raise HTTPException(403, "无权限查询")
 
+    container_name = record["container_name"]
+    if not container_name:
+        return {"container_name": "", "status": "not_bound"}
+    # 安全校验
+    import re
+    if not re.fullmatch(r'ones-ai-[\w-]+', container_name):
+        raise HTTPException(400, "容器名格式异常")
 
-@router.delete("/code-paths/{path_id}")
-async def delete_code_path(
-    path_id: int,
-    user: UserInfo = Depends(get_current_user),
-):
-    """删除历史代码路径 [FR-107]"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM user_code_paths WHERE id=$1 AND user_id=$2",
-            path_id, user.id,
+    # 通过 SSH 查询状态
+    try:
+        ssh_password = decrypt_password(record["ssh_password_encrypted"])
+        ssh_conn = await get_ssh_connection(
+            record["host"], record["ssh_port"],
+            record["ssh_username"], ssh_password
         )
-    return {"message": "已删除"}
+        # 查询状态和创建时间
+        res = await ssh_conn.run(
+            f"docker inspect -f '{{{{.State.Status}}}},{{{{.Created}}}}' {container_name}"
+        )
+        if res.exit_status == 0:
+            status, created = res.stdout.strip().split(',', 1)
+            return {
+                "container_name": container_name,
+                "status": status,  # running, exited, etc.
+                "created_at": created,
+            }
+        else:
+            return {"container_name": container_name, "status": "not_found"}
+    except Exception as e:
+        logger.error(f"获取容器状态失败: {e}")
+        return {"container_name": container_name, "status": "error", "message": str(e)}
 
+
+@router.post("/{task_id}/tickets/{ticket_db_id}/container/start")
+async def start_ticket_container(
+    task_id: int, ticket_db_id: int,
+    user: UserInfo = Depends(get_current_user),
+):
+    """一键唤醒(启动)已停止的容器，或为未绑定容器的工单创建新容器"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        record = await conn.fetchrow("""
+            SELECT tt.container_name, tt.ticket_id, tt.code_directory, tt.note,
+                   tt.conversation_id,
+                   t.user_id, t.agent_dir, t.task_mode, t.status AS task_status,
+                   usc.ssh_username, usc.ssh_password_encrypted,
+                   s.host, s.ssh_port
+            FROM task_tickets tt
+            JOIN tasks t ON t.id = tt.task_id
+            JOIN user_server_credentials usc ON usc.id = t.credential_id
+            JOIN servers s ON s.id = t.server_id
+            WHERE tt.id = $1 AND tt.task_id = $2
+        """, ticket_db_id, task_id)
+
+    if not record:
+        raise HTTPException(404, "工单不存在")
+    if record["user_id"] != user.id and user.role != "admin":
+        raise HTTPException(403, "无权限启动")
+    if record["task_status"] == "running":
+        raise HTTPException(400, "任务正在自动化执行，禁止挂起或创建干预容器")
+
+    import re
+    container_name = record["container_name"] or ""
+
+    try:
+        ssh_password = decrypt_password(record["ssh_password_encrypted"])
+        ssh_conn = await get_ssh_connection(
+            record["host"], record["ssh_port"],
+            record["ssh_username"], ssh_password
+        )
+
+        # 情况1: 有容器名 → 检查状态
+        is_intervene_container = "intervene" in container_name
+        if container_name and re.fullmatch(r'ones-ai-[\w-]+', container_name):
+            check = await ssh_conn.run(
+                f"docker inspect -f '{{{{.State.Status}}}}' {container_name} 2>/dev/null"
+            )
+            if check.exit_status == 0:
+                status = check.stdout.strip()
+                if status == "running":
+                    # 容器正在运行（任务执行中 或 干预容器未退出）
+                    return {"message": "容器已在运行中", "container_name": container_name}
+                if is_intervene_container:
+                    # 干预容器已停止 → docker start（主进程是 bash，安全）
+                    logger.info(f"正在唤醒干预容器: {container_name}")
+                    res = await ssh_conn.run(f"docker start {container_name}")
+                    if res.exit_status != 0:
+                        raise HTTPException(500, f"容器启动失败: {res.stderr}")
+                    return {"message": "容器已成功唤醒", "container_name": container_name}
+                # 任务容器已停止 → 不能 docker start（会重跑任务），创建干预容器
+                logger.info(f"任务容器 {container_name} 已停止，创建干预容器")
+            else:
+                logger.info(f"容器 {container_name} 已不存在，将创建新容器")
+
+        # 情况2: 容器不存在或未绑定 → 创建新的交互式容器
+        ssh_user = record["ssh_username"]
+
+        # 获取用户 HOME 目录
+        home_res = await ssh_conn.run(f"echo ~{ssh_user}")
+        user_home = home_res.stdout.strip() or f"/home/{ssh_user}"
+        # 解析可能的符号链接
+        realpath_res = await ssh_conn.run(f"readlink -f {user_home} 2>/dev/null || echo {user_home}")
+        user_home = realpath_res.stdout.strip() or user_home
+
+        code_dir = record["code_directory"] or user_home
+        agent_dir = record["agent_dir"] or ""
+
+        # 获取 API Key（模仿 ones-AI 脚本）
+        key_script = (
+            "python3 -c \""
+            "import json,urllib.request;"
+            f"r=urllib.request.urlopen('http://172.60.1.35:9601/api/allocate?username={ssh_user}',timeout=10);"
+            "d=json.loads(r.read());"
+            "print(d.get('api_key','') if d.get('success') else '')"
+            "\" 2>/dev/null"
+        )
+        key_res = await ssh_conn.run(key_script)
+        api_key = key_res.stdout.strip()
+        if not api_key:
+            raise HTTPException(500, "无法获取 API Key，请检查密钥网关")
+
+        # 生成容器名
+        import time as _time
+        new_container_name = f"ones-ai-{ssh_user}-intervene-{int(_time.time()) % 100000}"
+
+        # 构建 docker run 命令（模仿 ones-AI 脚本但不执行 runner）
+        # 使用 -dit 后台启动，用户通过 WebTerminal 连入
+        uid_res = await ssh_conn.run(f"id -u {ssh_user} 2>/dev/null")
+        gid_res = await ssh_conn.run(f"id -g {ssh_user} 2>/dev/null")
+        uid = uid_res.stdout.strip() or "1000"
+        gid = gid_res.stdout.strip() or "1000"
+
+        # 创建临时 passwd 和 group 文件（消除 groups 警告）
+        passwd_line = f"{ssh_user}:x:{uid}:{gid}:{ssh_user}:{user_home}:/bin/bash"
+        group_line = f"{ssh_user}:x:{gid}:"
+        await ssh_conn.run(f"echo '{passwd_line}' > /tmp/{new_container_name}-passwd")
+        await ssh_conn.run(f"echo '{group_line}' > /tmp/{new_container_name}-group")
+
+        # 构建挂载参数
+        mounts = [
+            f"-v {user_home}:{user_home}",
+            f"-v /opt/lango:/opt/lango:ro",
+            f"-v /tmp/{new_container_name}-passwd:/etc/passwd:ro",
+            f"-v /tmp/{new_container_name}-group:/etc/group:ro",
+        ]
+        if agent_dir and not agent_dir.startswith(user_home):
+            mounts.append(f"-v {agent_dir}:{agent_dir}:ro")
+
+        mount_str = " ".join(mounts)
+
+        docker_cmd = (
+            f"docker run -dit "
+            f"--name {new_container_name} "
+            f"--user {uid}:{gid} "
+            f"--network host "
+            f"--entrypoint /bin/bash "
+            f"-e HOME={user_home} "
+            f"-e USER={ssh_user} "
+            f"-e TERM=xterm-256color "
+            f"-e ANTHROPIC_AUTH_TOKEN={api_key} "
+            f'-e ANTHROPIC_BASE_URL={settings.AI_BASE_URL} '
+            f"-e ANTHROPIC_DEFAULT_HAIKU_MODEL={settings.CLAUDE_HAIKU_MODEL} "
+            f"-e ANTHROPIC_DEFAULT_SONNET_MODEL={settings.CLAUDE_SONNET_MODEL} "
+            f"-e ANTHROPIC_DEFAULT_OPUS_MODEL={settings.CLAUDE_OPUS_MODEL} "
+            f"-e API_TIMEOUT_MS=3000000 "
+            f"-e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 "
+            f"-e GIT_DISCOVERY_ACROSS_FILESYSTEM=1 "
+            f"{mount_str} "
+            f"-w {code_dir} "
+            f"lango-claude:latest"
+        )
+
+        logger.info(f"正在创建干预容器: {new_container_name}")
+        res = await ssh_conn.run(docker_cmd)
+        if res.exit_status != 0:
+            raise HTTPException(500, f"容器创建失败: {res.stderr}")
+
+        # 在容器内设置 git safe.directory
+        await ssh_conn.run(
+            f"docker exec {new_container_name} git config --global --add safe.directory '*' 2>/dev/null"
+        )
+
+        # 写入自动启动脚本：
+        # - 有 conversation_id → resume 上次干预会话
+        # - 无 conversation_id → 新建会话，告知 ones-AI 报告位置
+        ticket_id_str = record["ticket_id"] or ""
+        conversation_id = record.get("conversation_id") or ""
+
+        if conversation_id:
+            # 后续干预：resume 上次的干预会话
+            lines = [
+                "#!/bin/bash",
+                "if [ ! -f /tmp/.claude_resumed ]; then",
+                "  touch /tmp/.claude_resumed",
+                "  echo ''",
+                f"  echo '🔧 干预模式 - 工单 {ticket_id_str}'",
+                f"  echo '🔑 恢复上次干预会话: {conversation_id}'",
+                "  echo ''",
+                f"  claude --resume --conversation-id {conversation_id} 2>/dev/null || claude",
+                "fi",
+            ]
+        else:
+            # 首次干预：直接启动交互式 claude，提示报告位置
+            lines = [
+                "#!/bin/bash",
+                "if [ ! -f /tmp/.claude_resumed ]; then",
+                "  touch /tmp/.claude_resumed",
+                "  echo ''",
+                f"  echo '🔧 干预模式 - 工单 {ticket_id_str} (首次)'",
+                f"  REPORT=$(find {code_dir} -path '*/doc/{ticket_id_str}/report/1.md' 2>/dev/null | head -1)",
+                '  if [ -n \\"$REPORT\\" ]; then',
+                '    echo \\"📄 ones-AI 报告: $REPORT\\"',
+                "    echo '💡 进入 Claude 后，请告诉它阅读上述报告路径'",
+                "  else",
+                "    echo '⚠️ 未找到 ones-AI 报告'",
+                "  fi",
+                "  echo ''",
+                "  claude",
+                "fi",
+            ]
+
+        # 用 base64 编码写入脚本（避免 SSH + docker exec 多层转义问题）
+        import base64 as _b64
+        script_content = "\n".join(lines)
+        b64 = _b64.b64encode(script_content.encode()).decode()
+        await ssh_conn.run(
+            f"docker exec {new_container_name} bash -c \"echo '{b64}' | base64 -d > /tmp/auto_resume.sh && chmod +x /tmp/auto_resume.sh\""
+        )
+
+        # 更新数据库中的容器名
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE task_tickets SET container_name=$1 WHERE id=$2",
+                new_container_name, ticket_db_id
+            )
+
+        logger.info(f"干预容器已创建: {new_container_name}, 已绑定到工单 {ticket_db_id}")
+        return {
+            "message": "干预容器已创建，请打开终端操作",
+            "container_name": new_container_name,
+            "created": True,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"启动/创建容器失败: {e}")
+        raise HTTPException(500, f"服务器连接异常: {e}")
 

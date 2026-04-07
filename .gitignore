@@ -28,3 +28,19 @@ data/
 
 # Logs
 *.log
+
+# Deploy scripts (one-off)
+deploy*.py
+deploy*.sh
+deploy*.txt
+check_*.py
+fix_*.py
+import_*.py
+setup_*.py
+test_*.py
+verify_*.py
+_deploy_web_backup/
+build_result.txt
+
+# Prod env
+.env.prod

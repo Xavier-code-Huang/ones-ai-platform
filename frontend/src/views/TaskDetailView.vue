@@ -55,23 +55,9 @@
                    :stroke-width="8"
                    :color="[{color:'#3b82f6',percentage:30},{color:'#1e40af',percentage:70},{color:'#22c55e',percentage:100}]" />
       <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
-        <p style="color:var(--text-muted);font-size:0.82rem;margin:0;">任务正在执行中，请稍候...</p>
-        <el-button size="small" type="warning" round @click="showTerminal = !showTerminal">
-          🖥️ {{ showTerminal ? '关闭终端' : '进入服务器' }}
-        </el-button>
+        <p style="color:var(--text-muted);font-size:0.82rem;margin:0;">任务正在执行中，请耐心等待或选择下方工单进行干预...</p>
       </div>
     </div>
-
-    <!-- Web Terminal 面板 -->
-    <WebTerminal
-      v-if="task.status==='running'"
-      :task-id="Number(route.params.id)"
-      :visible="showTerminal"
-      :server-info="task.server_name || ''"
-      @close="showTerminal = false"
-      style="margin-top:12px;"
-    />
-
     <!-- 日志查看器 -->
     <div v-if="showLog" class="glass-card fade-in-up" style="margin-top:16px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
@@ -143,14 +129,42 @@
                   <span :class="'badge badge-'+statusColor(selectedTicket.status)">{{ statusLabel(selectedTicket.status) }}</span>
                   <span v-if="selectedTicket.duration" class="ticket-duration">{{ selectedTicket.duration.toFixed(0) }}s</span>
                 </div>
+                <!-- 容器控制按钮 -->
+                <div v-if="['running', 'completed', 'failed', 'cancelled'].includes(task.status)" class="container-controls" style="margin-left:auto;">
+                  <!-- 场景A: 任务执行中，但还没拿到容器名 -->
+                  <el-button v-if="task.status === 'running' && !currentContainerName" size="small" type="info" round disabled>
+                    ⏳ 容器准备中
+                  </el-button>
+                  <!-- 场景B: 任务执行中，且已拿到任务容器名 (观测模式) -->
+                  <el-button v-else-if="task.status === 'running' && currentContainerName" size="small" type="primary" round @click="toggleTerminal">
+                    🖥️ {{ showTerminal ? '收起终端' : '观测容器' }}
+                  </el-button>
+                  <!-- 场景C: 任务已结束 → 历史回放按钮 -->
+                  <el-button v-else-if="task.status !== 'running'" size="small" :type="showTerminal ? 'info' : 'primary'" round @click="toggleReplay" :loading="replayLoading">
+                    📼 {{ showTerminal ? '收起回放' : '历史回放' }}
+                  </el-button>
+                  <!-- 场景D: 唤醒干预环境（移到回放按钮旁边） -->
+                  <el-button v-if="task.status !== 'running' && !isInterveneContainer && !showTerminal" size="small" type="warning" round @click="startContainer" :loading="startingContainer" style="margin-left:6px;">
+                    📦 唤醒干预
+                  </el-button>
+                  <!-- 场景E: 有干预容器正在运行 -->
+                  <el-button v-if="task.status !== 'running' && isInterveneContainer && containerStatus === 'running'" size="small" type="success" round @click="toggleTerminal" style="margin-left:6px;">
+                    ⌨️ {{ showTerminal && terminalMode === 'live' ? '收起干预' : '进入干预' }}
+                  </el-button>
+                  <!-- 场景F: 有干预容器但休眠 -->
+                  <el-button v-if="task.status !== 'running' && isInterveneContainer && containerStatus !== 'running'" size="small" type="warning" round @click="startContainer" :loading="startingContainer" style="margin-left:6px;">
+                    ⚡ 恢复干预
+                  </el-button>
+                </div>
+                
                 <!-- 评价按钮 -->
-                <div v-if="selectedTicket.status==='completed' || selectedTicket.status==='failed'" class="eval-btns">
+                <div v-if="selectedTicket.status==='completed' || selectedTicket.status==='failed'" class="eval-btns" style="margin-left:12px;">
                   <template v-if="selectedTicket.evaluation">
                     <span :class="selectedTicket.evaluation.passed ? 'badge badge-success' : 'badge badge-danger'" style="padding:4px 12px;">
                       {{ selectedTicket.evaluation.passed ? '✅ 已通过' : '❌ 未通过' }}
                     </span>
                     <el-button size="small" type="warning" @click="openRework(selectedTicket)" round style="margin-left:8px;">
-                      🔄 打回重做
+                      🔄 打回
                     </el-button>
                   </template>
                   <template v-else>
@@ -161,11 +175,25 @@
                       <el-icon><Close /></el-icon>
                     </el-button>
                     <el-button size="small" type="warning" @click="openRework(selectedTicket)" round style="margin-left:8px;">
-                      🔄 打回重做
+                      🔄 打回
                     </el-button>
                   </template>
                 </div>
               </div>
+
+              <!-- Web Terminal 容器面板（支持 live / replay 模式） -->
+              <WebTerminal
+                ref="webTerminalRef"
+                :ticket-db-id="selectedTicket.id"
+                :ticket-id-str="selectedTicket.ticket_id"
+                :visible="showTerminal"
+                :server-info="task.server_name || ''"
+                :auto-resume="true"
+                :mode="terminalMode"
+                :replay-logs="replayLogs"
+                class="fade-in-down"
+                style="margin: 12px 0 16px 0;"
+              />
 
               <!-- AI 结论 -->
               <div v-if="selectedTicket.result_conclusion" class="conclusion-bar">
@@ -266,7 +294,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -285,7 +313,19 @@ const logLoading = ref(false)
 let ws = null
 let refreshInterval = null
 let _unmounted = false
+
+// Web Terminal 控制
 const showTerminal = ref(false)
+const containerStatus = ref(null) // running, exited, not_bound, not_found, error
+const currentContainerName = ref('')
+const isInterveneContainer = computed(() => currentContainerName.value.includes('intervene'))
+const startingContainer = ref(false)
+const webTerminalRef = ref(null)
+
+// 回放模式
+const terminalMode = ref('live')  // 'live' | 'replay'
+const replayLogs = ref([])
+const replayLoading = ref(false)
 
 const progress = ref(0)
 const reportDialogVisible = ref(false)
@@ -321,6 +361,107 @@ async function loadTicketPhases(ticketDbId) {
     ticketPhasesMap.value[ticketDbId] = []
   }
 }
+
+function toggleTerminal() {
+  terminalMode.value = 'live'
+  showTerminal.value = !showTerminal.value
+}
+
+async function toggleReplay() {
+  if (showTerminal.value && terminalMode.value === 'replay') {
+    // 收起回放
+    showTerminal.value = false
+    return
+  }
+  // 加载日志并开始回放
+  replayLoading.value = true
+  try {
+    const taskId = route.params.id
+    const ticketDbId = selectedTicketId.value
+    const data = await api.getTicketTerminalLogs(taskId, ticketDbId)
+    if (data.logs && data.logs.length) {
+      replayLogs.value = data.logs
+      terminalMode.value = 'replay'
+      showTerminal.value = true
+    } else {
+      ElMessage.info('暂无该工单的执行日志')
+    }
+  } catch (e) {
+    ElMessage.error('加载日志失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    replayLoading.value = false
+  }
+}
+
+// 查询容器状态
+async function fetchContainerStatus(ticketDbId) {
+  if (!ticketDbId) return
+  containerStatus.value = null
+  try {
+    const res = await api.getContainerStatus(route.params.id, ticketDbId)
+    containerStatus.value = res.status
+    currentContainerName.value = res.container_name || ''
+    if (res.status === 'running') {
+      // 若是正在执行的任务且刚选中工单默认打开终端的话可在此配置
+      if (task.value.status === 'running' && !showTerminal.value && !isInterveneContainer.value) {
+        showTerminal.value = true
+      }
+    } else {
+      showTerminal.value = false
+    }
+  } catch (e) {
+    console.error("查询容器状态失败", e)
+    containerStatus.value = 'error'
+  }
+}
+
+// 一键唤醒(启动)容器
+async function startContainer() {
+  startingContainer.value = true
+  try {
+    const res = await api.startContainer(route.params.id, selectedTicketId.value)
+    const data = res.data || res
+    if (data.created) {
+      // 新建的干预容器
+      const ticket = (task.value.tickets || []).find(t => t.id === selectedTicketId.value)
+      const ticketId = ticket?.ticket_id || ''
+      ElMessage({
+        type: 'success',
+        message: `干预容器已创建 (${data.container_name})，终端已打开`,
+        duration: 5000,
+      })
+      // 提示报告位置
+      if (ticketId) {
+        setTimeout(() => {
+          ElMessage({
+            type: 'info',
+            message: `💡 可在 claude 中引用: ~/*/workspace/doc/${ticketId}/report/1.md`,
+            duration: 10000,
+          })
+        }, 1500)
+      }
+    } else {
+      ElMessage.success(data.message || "容器唤醒成功")
+    }
+    // 刷新容器状态并打开终端
+    containerStatus.value = 'running'
+    showTerminal.value = true
+    // 重新获取容器状态以更新容器名
+    await fetchContainerStatus(selectedTicketId.value)
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || "容器唤醒失败")
+  } finally {
+    startingContainer.value = false
+  }
+}
+
+// 监听工单切换
+watch(selectedTicketId, (newId) => {
+  if (newId) {
+    showTerminal.value = false // 切换时先折叠终端
+    fetchContainerStatus(newId)
+  }
+})
 
 // 编辑工单
 const editDialogVisible = ref(false)
@@ -426,11 +567,23 @@ function connectWs() {
     } else if (msg.type === 'phases_snapshot') {
       ticketPhasesMap.value[msg.ticket_db_id] = msg.phases || []
       ticketPhasesMap.value = { ...ticketPhasesMap.value }
+    } else if (msg.type === 'container_bound') {
+      if (msg.ticket_db_id === selectedTicketId.value) {
+        currentContainerName.value = msg.container_name
+        containerStatus.value = 'running'
+        if (!showTerminal.value && !isInterveneContainer.value) {
+          showTerminal.value = true
+        }
+      }
     } else if (msg.type === 'complete') {
       loadTask()
+      fetchContainerStatus(selectedTicketId.value)
     } else if (msg.type === 'progress') {
       if (_progressTimer) clearTimeout(_progressTimer)
-      _progressTimer = setTimeout(() => loadTask(), 3000)
+      _progressTimer = setTimeout(() => {
+        loadTask()
+        if (selectedTicketId.value) fetchContainerStatus(selectedTicketId.value)
+      }, 3000)
     }
   }
   ws.onclose = () => { setTimeout(() => { if (!_unmounted && task.value.status === 'running') connectWs() }, 2000) }

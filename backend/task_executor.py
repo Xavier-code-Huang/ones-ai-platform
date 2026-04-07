@@ -182,6 +182,32 @@ async def _execute_task(task_id: int):
                 task_id,
             )
 
+            # 【重启恢复】如果有工单卡在 running 状态（后端重启杀死了执行进程），
+            # 自动重置为 pending 重新执行，无需用户手动打回
+            orphaned_running = await conn.fetch(
+                "SELECT id, ticket_id FROM task_tickets WHERE task_id=$1 AND status='running'",
+                task_id,
+            )
+            if orphaned_running:
+                orphan_ids = [o['ticket_id'] for o in orphaned_running]
+                logger.warning(f"任务 {task_id} 发现 {len(orphaned_running)} 个被中断的工单 {orphan_ids}，自动重置为 pending 重新执行")
+                for orph in orphaned_running:
+                    # 重置工单状态为 pending
+                    await conn.execute(
+                        "UPDATE task_tickets SET status='pending', error_message=NULL, container_name='', completed_at=NULL WHERE id=$1",
+                        orph["id"])
+                    # 清理残留 phases（全部删掉重建）
+                    await conn.execute(
+                        "DELETE FROM task_ticket_phases WHERE task_ticket_id=$1",
+                        orph["id"])
+                # 通知前端
+                restart_msg = f"⚠️ 系统重启检测到 {len(orphaned_running)} 个被中断的工单，正在自动恢复执行..."
+                await _save_log(task_id, restart_msg, "system")
+                await _broadcast_log(task_id, {
+                    "type": "log", "content": restart_msg, "log_type": "system",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
             # 获取待执行工单列表（仅 pending，打回重做场景下不重跑已完成工单）
             tickets = await conn.fetch(
                 "SELECT * FROM task_tickets WHERE task_id=$1 AND status='pending' ORDER BY seq_order",
@@ -190,10 +216,14 @@ async def _execute_task(task_id: int):
 
             # 空任务保护（无工单记录则直接完成，防止空壳任务卡在队列）
             if not tickets:
-                logger.warning(f"任务 {task_id} 无待执行工单，直接标记完成")
-                await conn.execute(
-                    "UPDATE tasks SET status='completed', completed_at=NOW() WHERE id=$1",
+                has_failed = await conn.fetchval(
+                    "SELECT count(*) FROM task_tickets WHERE task_id=$1 AND status='failed'",
                     task_id)
+                final_status = "failed" if has_failed else "completed"
+                logger.warning(f"任务 {task_id} 无待执行工单，标记为 {final_status}")
+                await conn.execute(
+                    "UPDATE tasks SET status=$2, completed_at=COALESCE(completed_at, NOW()), failed_count=$3 WHERE id=$1",
+                    task_id, final_status, has_failed or 0)
                 return
 
         # 广播状态变更
@@ -256,10 +286,11 @@ async def _execute_task(task_id: int):
                                             task_mode=task_mode)
             await _save_log(task_id, f"执行命令: {command}", "system")
 
-            # 标记工单为 running
+            # 标记工单为 running，清空旧容器信息（避免终端连到旧的干预容器）
             async with pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE task_tickets SET status='running', started_at=COALESCE(started_at, NOW()) WHERE id=$1",
+                    "UPDATE task_tickets SET status='running', started_at=COALESCE(started_at, NOW()), "
+                    "container_name='', conversation_id='' WHERE id=$1",
                     db_id)
 
             # 初始化阶段记录并推进前序阶段
@@ -338,12 +369,15 @@ async def _execute_task(task_id: int):
                     if not line:
                         continue
 
-                    # 捕获容器名（ones-AI 输出: "正在进入容器: ones-ai-xxx-123 ..."）
-                    if not container_name and ("正在进入容器" in line or "Entering container" in line):
+                    # 捕获容器名（ones-AI 输出多种格式：
+                    #   "[*] 启动 ones-AI (容器: ones-ai-lichao-211778)..."
+                    #   "正在进入容器: ones-ai-xxx-123"
+                    # 容器名格式固定: ones-ai-{用户名}-{PID数字}
+                    if not container_name and "ones-ai-" in line:
                         import re as _re
-                        _m = _re.search(r'(ones-ai-[\w-]+)', line)
+                        _m = _re.search(r'\bones-ai-\w+-\d+\b', line)
                         if _m:
-                            container_name = _m.group(1)
+                            container_name = _m.group(0)
                             logger.info(f"捕获容器名: {container_name}")
                             # 立即将容器名保存到数据库，供终端连接使用
                             async with pool.acquire() as conn:
@@ -351,6 +385,12 @@ async def _execute_task(task_id: int):
                                     "UPDATE task_tickets SET container_name=$1 WHERE id=$2",
                                     container_name, db_id
                                 )
+                            # 立即向前端推送容器绑定事件，立刻点亮观测按钮
+                            await _broadcast_log(task_id, {
+                                "type": "container_bound",
+                                "container_name": container_name,
+                                "ticket_db_id": db_id
+                            })
 
                     # 解析 [PHASE] 标记行（由 runner 输出）
                     if line.startswith("[PHASE]"):
@@ -544,10 +584,21 @@ async def _execute_task(task_id: int):
             if ticket_success:
                 await complete_remaining_phases(db_id, "completed", "任务完成")
             else:
-                await complete_remaining_phases(db_id, "skipped", "前序阶段失败，已跳过")
+                await complete_remaining_phases(db_id, "skipped", "前序阶段或执行异常，已跳过")
+
+            # 强制推送全量状态刷新给前端，修正 UI 卡点
+            from phases import get_phases
+            final_phases = await get_phases(db_id)
+            await _broadcast_log(task_id, {
+                "type": "phases_snapshot",
+                "ticket_db_id": db_id,
+                "phases": final_phases,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
 
             # 执行完一个工单后立即下载报告（传入容器名用于 docker exec 读取）
             await _download_single_report(ssh_conn, pool, db_id, container_name=container_name)
+
 
             # 增量更新 tasks 表（前端实时看到进度）
             async with pool.acquire() as conn:

@@ -263,6 +263,39 @@ async def get_team_stats(
     }
 
 
+@router.get("/api/admin/external-teams/{team_id}/members/{member_name}/logs")
+async def get_member_logs(
+    team_id: int, member_name: str,
+    days: int = Query(30, ge=1, le=365),
+    admin: UserInfo = Depends(require_admin),
+):
+    """获取某成员的详细日志列表（字段与上报接口文档一致）"""
+    pool = await get_pool()
+    since = datetime.utcnow() - timedelta(days=days)
+    async with pool.acquire() as conn:
+        logs = await conn.fetch("""
+            SELECT ticket_id, action_type, status, duration, summary, reported_at
+            FROM external_logs
+            WHERE team_id=$1 AND member_name=$2 AND reported_at >= $3
+            ORDER BY reported_at DESC
+        """, team_id, member_name, since)
+
+    return {
+        "member_name": member_name,
+        "logs": [
+            {
+                "ticket_id": l["ticket_id"] or "",
+                "action_type": l["action_type"] or "process",
+                "status": l["status"] or "completed",
+                "duration": round(float(l["duration"] or 0), 1),
+                "summary": l["summary"] or "",
+                "reported_at": str(l["reported_at"]),
+            }
+            for l in logs
+        ],
+    }
+
+
 @router.get("/api/admin/external-overview")
 async def get_external_overview(
     days: int = Query(30, ge=1, le=365),

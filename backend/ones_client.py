@@ -34,7 +34,7 @@ async def verify_ones_login(email: str, password: str) -> dict:
     Raises:
         OnesClientError: 登录失败
     """
-    login_url = f"{settings.ONES_API_GATEWAY}/api-ones/proxy/project/api/project/auth/login"
+    login_url = f"{settings.ONES_API_BASE_URL}/project/api/project/auth/login"
     logger.info(f"ONES 登录验证: email={email}")
 
     try:

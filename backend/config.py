@@ -64,7 +64,12 @@ class Settings(BaseSettings):
     AI_BASE_URL: str = "https://open.bigmodel.cn/api/anthropic"
     AI_API_KEY: str = ""  # 智谱 API Key，用于 AI 预分析
     AI_SONNET_MODEL: str = "glm-4.7"
-    AI_OPUS_MODEL: str = "glm-5"
+    AI_OPUS_MODEL: str = "glm-5.1"
+
+    # Claude Code 容器默认模型映射（runner + 干预容器共用）
+    CLAUDE_HAIKU_MODEL: str = "glm-4.7"
+    CLAUDE_SONNET_MODEL: str = "glm-5.1"   # Claude Code 默认使用的模型
+    CLAUDE_OPUS_MODEL: str = "glm-5.1"
 
     # ---- Gerrit 占位 (Phase 2) ----
     GERRIT_HOST_1: str = "__GERRIT_HOST_1__"

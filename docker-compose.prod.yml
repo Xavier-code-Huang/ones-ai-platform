@@ -15,13 +15,12 @@ services:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
 
-  # 后端 FastAPI
+  # 后端 FastAPI (host 网络模式，监听 APP_PORT=9620)
   backend:
     build: ./backend
     image: ones-ai-backend:latest
     container_name: onesai-backend
-    ports:
-      - "9625:9625"
+    network_mode: host
     env_file: .env
     depends_on:
       - postgres
@@ -29,16 +28,16 @@ services:
     volumes:
       - ./data:/app/data
 
-  # 前端 Nginx
+  # 前端 Nginx (host 网络模式，nginx 监听 9621)
   frontend:
     build: ./frontend
     image: ones-ai-frontend:latest
     container_name: onesai-frontend
-    ports:
-      - "9626:80"
+    network_mode: host
     depends_on:
       - backend
     restart: unless-stopped
 
 volumes:
   pgdata:
+
