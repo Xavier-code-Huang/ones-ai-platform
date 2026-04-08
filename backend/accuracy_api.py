@@ -35,8 +35,8 @@ async def get_accuracy_summary():
             FROM accuracy_evaluations
         """)
 
-        # 待评测数
-        pending = await conn.fetchval("""
+        # 待评测数（内部）
+        pending_internal = await conn.fetchval("""
             SELECT COUNT(*) FROM task_tickets tt
             LEFT JOIN accuracy_evaluations ae ON ae.task_ticket_id = tt.id
             WHERE tt.status = 'completed'
@@ -44,6 +44,17 @@ async def get_accuracy_summary():
               AND tt.result_report IS NOT NULL
               AND tt.result_report != ''
         """)
+
+        # 待评测数（外部）[FR-302]
+        pending_external = await conn.fetchval("""
+            SELECT COUNT(*) FROM external_logs el
+            LEFT JOIN accuracy_evaluations ae ON ae.external_log_id = el.id AND ae.source = 'external'
+            WHERE ae.id IS NULL
+              AND el.ai_report IS NOT NULL AND el.ai_report != ''
+              AND el.ticket_id IS NOT NULL AND el.ticket_id != ''
+        """)
+
+        pending = (pending_internal or 0) + (pending_external or 0)
 
         total_tickets = await conn.fetchval(
             "SELECT COUNT(DISTINCT ticket_id) FROM task_tickets WHERE status='completed'"
@@ -93,9 +104,10 @@ async def get_accuracy_tickets(
         """)
 
         rows = await conn.fetch(f"""
-            SELECT ae.*, tt.ticket_title
+            SELECT ae.*, COALESCE(tt.ticket_title, el.summary, ae.ticket_id) as display_title
             FROM accuracy_evaluations ae
-            JOIN task_tickets tt ON tt.id = ae.task_ticket_id
+            LEFT JOIN task_tickets tt ON tt.id = ae.task_ticket_id
+            LEFT JOIN external_logs el ON el.id = ae.external_log_id
             WHERE (ae.skip_reason = '' OR ae.skip_reason IS NULL) {where}
             ORDER BY ae.total_score DESC, ae.evaluated_at DESC
             LIMIT $1 OFFSET $2
@@ -106,7 +118,8 @@ async def get_accuracy_tickets(
         items.append({
             "id": r["id"],
             "ticket_id": r["ticket_id"],
-            "ticket_title": r["ticket_title"] or "",
+            "ticket_title": r["display_title"] or "",
+            "source": r["source"] or "internal",
             "gerrit_change_url": r["gerrit_change_url"],
             "gerrit_diff_summary": r["gerrit_diff_summary"],
             "scores": {

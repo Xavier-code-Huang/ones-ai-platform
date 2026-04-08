@@ -7,6 +7,7 @@
 外部团队可以通过 API Key 上报日志数据，管理员可以查看统计。
 """
 
+import json
 import secrets
 import logging
 from datetime import datetime, timedelta
@@ -31,6 +32,11 @@ class LogEntry(BaseModel):
     status: str = "completed"
     duration: float = 0
     summary: str = ""
+    # v1.6.0: Patch 统计 + AI 报告 [FR-301]
+    ai_report: str = ""
+    patch_files: list[str] = []
+    patch_insertions: int = 0
+    patch_deletions: int = 0
 
 
 class ReportRequest(BaseModel):
@@ -101,9 +107,14 @@ async def report_logs(req: ReportRequest, x_api_key: str = Header(..., alias="X-
         inserted = 0
         for log in req.logs:
             await conn.execute("""
-                INSERT INTO external_logs (team_id, member_name, ticket_id, action_type, status, duration, summary)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-            """, team_id, log.member_name, log.ticket_id, log.action_type, log.status, log.duration, log.summary)
+                INSERT INTO external_logs
+                (team_id, member_name, ticket_id, action_type, status, duration, summary,
+                 ai_report, patch_files, patch_insertions, patch_deletions)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+            """, team_id, log.member_name, log.ticket_id, log.action_type,
+                log.status, log.duration, log.summary,
+                log.ai_report, json.dumps(log.patch_files),
+                log.patch_insertions, log.patch_deletions)
 
             # 自动注册成员
             await conn.execute("""

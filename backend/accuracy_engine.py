@@ -648,51 +648,60 @@ Changes: +{change.insertions}/-{change.deletions}"""
             return 0
 
     async def save_result(self, result: EvalResult):
-        """保存评测结果到数据库"""
+        """保存评测结果到数据库（内部工单）"""
         async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO accuracy_evaluations (
-                    task_ticket_id, ticket_id,
-                    gerrit_change_id, gerrit_change_url, gerrit_files,
-                    gerrit_diff_summary, gerrit_commit_msg,
-                    score_file_match, score_root_cause, score_fix_similar,
-                    score_actionable, score_consistency, total_score,
-                    is_effective, llm_reasoning, skip_reason
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-                ON CONFLICT (task_ticket_id) DO UPDATE SET
-                    gerrit_change_id=EXCLUDED.gerrit_change_id,
-                    gerrit_change_url=EXCLUDED.gerrit_change_url,
-                    gerrit_files=EXCLUDED.gerrit_files,
-                    gerrit_diff_summary=EXCLUDED.gerrit_diff_summary,
-                    gerrit_commit_msg=EXCLUDED.gerrit_commit_msg,
-                    score_file_match=EXCLUDED.score_file_match,
-                    score_root_cause=EXCLUDED.score_root_cause,
-                    score_fix_similar=EXCLUDED.score_fix_similar,
-                    score_actionable=EXCLUDED.score_actionable,
-                    score_consistency=EXCLUDED.score_consistency,
-                    total_score=EXCLUDED.total_score,
-                    is_effective=EXCLUDED.is_effective,
-                    llm_reasoning=EXCLUDED.llm_reasoning,
-                    skip_reason=EXCLUDED.skip_reason,
-                    evaluated_at=NOW()
-            """,
-                result.task_ticket_id, result.ticket_id,
-                result.gerrit_change_id, result.gerrit_change_url,
-                json.dumps(result.gerrit_files, ensure_ascii=False),
-                result.gerrit_diff_summary, result.gerrit_commit_msg,
-                result.score_file_match, result.score_root_cause,
-                result.score_fix_similar, result.score_actionable,
-                result.score_consistency, result.total_score,
-                result.is_effective, result.reasoning,
-                result.skip_reason,
+            # 检查是否已存在（task_ticket_id 不再 UNIQUE，改用手动 upsert）
+            existing = await conn.fetchval(
+                "SELECT id FROM accuracy_evaluations WHERE task_ticket_id=$1 AND source='internal'",
+                result.task_ticket_id
             )
+            if existing:
+                await conn.execute("""
+                    UPDATE accuracy_evaluations SET
+                        ticket_id=$1, gerrit_change_id=$2, gerrit_change_url=$3,
+                        gerrit_files=$4, gerrit_diff_summary=$5, gerrit_commit_msg=$6,
+                        score_file_match=$7, score_root_cause=$8, score_fix_similar=$9,
+                        score_actionable=$10, score_consistency=$11, total_score=$12,
+                        is_effective=$13, llm_reasoning=$14, skip_reason=$15, evaluated_at=NOW()
+                    WHERE id=$16
+                """,
+                    result.ticket_id, result.gerrit_change_id, result.gerrit_change_url,
+                    json.dumps(result.gerrit_files, ensure_ascii=False),
+                    result.gerrit_diff_summary, result.gerrit_commit_msg,
+                    result.score_file_match, result.score_root_cause,
+                    result.score_fix_similar, result.score_actionable,
+                    result.score_consistency, result.total_score,
+                    result.is_effective, result.reasoning, result.skip_reason,
+                    existing,
+                )
+            else:
+                await conn.execute("""
+                    INSERT INTO accuracy_evaluations (
+                        task_ticket_id, ticket_id, source,
+                        gerrit_change_id, gerrit_change_url, gerrit_files,
+                        gerrit_diff_summary, gerrit_commit_msg,
+                        score_file_match, score_root_cause, score_fix_similar,
+                        score_actionable, score_consistency, total_score,
+                        is_effective, llm_reasoning, skip_reason
+                    ) VALUES ($1,$2,'internal',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                """,
+                    result.task_ticket_id, result.ticket_id,
+                    result.gerrit_change_id, result.gerrit_change_url,
+                    json.dumps(result.gerrit_files, ensure_ascii=False),
+                    result.gerrit_diff_summary, result.gerrit_commit_msg,
+                    result.score_file_match, result.score_root_cause,
+                    result.score_fix_similar, result.score_actionable,
+                    result.score_consistency, result.total_score,
+                    result.is_effective, result.reasoning, result.skip_reason,
+                )
 
     async def batch_evaluate(self, limit: int = 50) -> dict:
-        """批量评测已完成但未评测的工单"""
+        """批量评测已完成但未评测的工单（内部 + 外部）[FR-302]"""
         async with self.pool.acquire() as conn:
+            # 内部待评测
             rows = await conn.fetch("""
                 SELECT tt.id FROM task_tickets tt
-                LEFT JOIN accuracy_evaluations ae ON ae.task_ticket_id = tt.id
+                LEFT JOIN accuracy_evaluations ae ON ae.task_ticket_id = tt.id AND ae.source = 'internal'
                 WHERE tt.status = 'completed'
                   AND ae.id IS NULL
                   AND tt.result_report IS NOT NULL
@@ -723,6 +732,15 @@ Changes: +{change.insertions}/-{change.deletions}"""
                 errors += 1
                 logger.error(f"评测 task_ticket#{row['id']} 异常: {e}")
 
+        # [FR-302] 外部数据评测
+        remaining = max(limit - total, 0)  # 外部名额 = 总配额 - 内部已用
+        ext_evaluated, ext_effective, ext_skipped, ext_errors = await self._batch_evaluate_external(remaining)
+        total += (ext_evaluated + ext_skipped + ext_errors)
+        evaluated += ext_evaluated
+        effective += ext_effective
+        skipped += ext_skipped
+        errors += ext_errors
+
         return {
             "total": total,
             "evaluated": evaluated,
@@ -731,3 +749,167 @@ Changes: +{change.insertions}/-{change.deletions}"""
             "errors": errors,
             "accuracy_rate": f"{effective / evaluated * 100:.1f}%" if evaluated > 0 else "N/A",
         }
+
+    # ---- 外部数据评测 [FR-302] ----
+
+    async def evaluate_external_log(self, log_id: int) -> EvalResult:
+        """评测外部团队上报的日志（逻辑与 evaluate_ticket 一致）"""
+        result = EvalResult()
+
+        async with self.pool.acquire() as conn:
+            log = await conn.fetchrow("SELECT * FROM external_logs WHERE id=$1", log_id)
+
+        if not log:
+            result.skip_reason = "外部日志不存在"
+            return result
+
+        ticket_id = log["ticket_id"] or ""
+        if not ticket_id:
+            result.skip_reason = "无工单号"
+            return result
+
+        ai_report = log["ai_report"] or ""
+        summary = log["summary"] or ""
+        full_ai_text = f"{ai_report}\n{summary}"
+
+        if len(full_ai_text.strip()) < 50:
+            result.skip_reason = "AI 报告内容为空"
+            return result
+
+        result.ticket_id = ticket_id
+
+        # 从 Gerrit 搜索关联提交
+        gerrit_changes = await self._search_gerrit(ticket_id)
+        if not gerrit_changes:
+            result.skip_reason = "Gerrit 中未找到关联提交"
+            return result
+
+        best_change = self._pick_best_change(gerrit_changes, ticket_id)
+        result.gerrit_change_id = best_change.change_id
+        result.gerrit_change_url = f"{GERRIT_INSTANCES[0].base_url}/#/c/{best_change.number}/"
+        result.gerrit_files = list(best_change.files.keys())
+        result.gerrit_commit_msg = best_change.commit_message or best_change.subject
+        result.gerrit_diff_summary = f"+{best_change.insertions}/-{best_change.deletions}"
+
+        # 五维度打分
+        ai_files = extract_file_paths(full_ai_text)
+        gerrit_files_set = set(best_change.files.keys())
+        result.score_file_match = score_file_match(ai_files, gerrit_files_set)
+
+        ai_funcs = extract_function_names(full_ai_text)
+        gerrit_funcs = set()
+        if best_change.diff_content:
+            gerrit_funcs = extract_diff_function_names(best_change.diff_content)
+            gerrit_funcs |= extract_function_names(best_change.diff_content)
+        if not gerrit_funcs and best_change.commit_message:
+            gerrit_funcs = extract_function_names(best_change.commit_message)
+        result.score_root_cause = score_root_cause(
+            ai_funcs, gerrit_funcs, ai_files=ai_files, gerrit_files=gerrit_files_set
+        )
+
+        result.score_fix_similar = await self._score_fix_similarity(
+            full_ai_text, best_change, ticket_id
+        )
+        result.score_actionable = score_actionable(ai_report, "", "")
+        result.score_consistency = self._score_consistency(
+            ticket_id, summary, best_change.subject, full_ai_text
+        )
+
+        result.total_score = (
+            result.score_file_match + result.score_root_cause +
+            result.score_fix_similar + result.score_actionable +
+            result.score_consistency
+        )
+        result.is_effective = result.total_score >= 40
+        result.reasoning = (
+            f"[外部] 文件={result.score_file_match}/20, "
+            f"根因={result.score_root_cause}/20, "
+            f"方案={result.score_fix_similar}/25, "
+            f"可操作={result.score_actionable}/15, "
+            f"一致性={result.score_consistency}/20 → "
+            f"总分={result.total_score}/100 ({'有效' if result.is_effective else '无效'})"
+        )
+        return result
+
+    async def save_external_result(self, result: EvalResult, log_id: int):
+        """保存外部评测结果"""
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchval(
+                "SELECT id FROM accuracy_evaluations WHERE external_log_id=$1 AND source='external'",
+                log_id
+            )
+            if existing:
+                await conn.execute("""
+                    UPDATE accuracy_evaluations SET
+                        ticket_id=$1, gerrit_change_id=$2, gerrit_change_url=$3,
+                        gerrit_files=$4, gerrit_diff_summary=$5, gerrit_commit_msg=$6,
+                        score_file_match=$7, score_root_cause=$8, score_fix_similar=$9,
+                        score_actionable=$10, score_consistency=$11, total_score=$12,
+                        is_effective=$13, llm_reasoning=$14, skip_reason=$15, evaluated_at=NOW()
+                    WHERE id=$16
+                """,
+                    result.ticket_id, result.gerrit_change_id, result.gerrit_change_url,
+                    json.dumps(result.gerrit_files, ensure_ascii=False),
+                    result.gerrit_diff_summary, result.gerrit_commit_msg,
+                    result.score_file_match, result.score_root_cause,
+                    result.score_fix_similar, result.score_actionable,
+                    result.score_consistency, result.total_score,
+                    result.is_effective, result.reasoning, result.skip_reason,
+                    existing,
+                )
+            else:
+                await conn.execute("""
+                    INSERT INTO accuracy_evaluations (
+                        task_ticket_id, ticket_id, source, external_log_id,
+                        gerrit_change_id, gerrit_change_url, gerrit_files,
+                        gerrit_diff_summary, gerrit_commit_msg,
+                        score_file_match, score_root_cause, score_fix_similar,
+                        score_actionable, score_consistency, total_score,
+                        is_effective, llm_reasoning, skip_reason
+                    ) VALUES (NULL,$1,'external',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                """,
+                    result.ticket_id, log_id,
+                    result.gerrit_change_id, result.gerrit_change_url,
+                    json.dumps(result.gerrit_files, ensure_ascii=False),
+                    result.gerrit_diff_summary, result.gerrit_commit_msg,
+                    result.score_file_match, result.score_root_cause,
+                    result.score_fix_similar, result.score_actionable,
+                    result.score_consistency, result.total_score,
+                    result.is_effective, result.reasoning, result.skip_reason,
+                )
+
+    async def _batch_evaluate_external(self, limit: int) -> tuple:
+        """批量评测外部日志"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT el.id FROM external_logs el
+                LEFT JOIN accuracy_evaluations ae ON ae.external_log_id = el.id AND ae.source = 'external'
+                WHERE ae.id IS NULL
+                  AND el.ai_report IS NOT NULL AND el.ai_report != ''
+                  AND el.ticket_id IS NOT NULL AND el.ticket_id != ''
+                ORDER BY el.reported_at DESC
+                LIMIT $1
+            """, limit)
+
+        evaluated = 0
+        effective = 0
+        skipped = 0
+        errors = 0
+
+        for row in rows:
+            try:
+                result = await self.evaluate_external_log(row["id"])
+                if result.skip_reason:
+                    skipped += 1
+                    logger.info(f"[外部] 跳过 log#{row['id']}: {result.skip_reason}")
+                else:
+                    evaluated += 1
+                    if result.is_effective:
+                        effective += 1
+                    logger.info(f"[外部] 评测 {result.ticket_id}: {result.total_score}分")
+                await self.save_external_result(result, row["id"])
+            except Exception as e:
+                errors += 1
+                logger.error(f"[外部] 评测 log#{row['id']} 异常: {e}")
+
+        return evaluated, effective, skipped, errors

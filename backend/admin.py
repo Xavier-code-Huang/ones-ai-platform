@@ -68,9 +68,10 @@ async def get_overview(
     days: int = Query(30, ge=1, le=365),
     admin: UserInfo = Depends(require_admin),
 ):
-    """总览数据 [FR-010]"""
+    """总览数据（内部+外部合并）[FR-010, FR-304]"""
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # 内部数据
         row = await conn.fetchrow("""
             SELECT
                 COUNT(DISTINCT t.id) as total_tasks,
@@ -90,14 +91,58 @@ async def get_overview(
             WHERE t.created_at >= NOW() - ($1 || ' days')::INTERVAL
         """, str(days))
 
+        # [FR-304] 外部数据
+        ext = await conn.fetchrow("""
+            SELECT
+                COUNT(*) as ext_logs,
+                COUNT(DISTINCT el.ticket_id) FILTER (WHERE el.ticket_id != '') as ext_tickets,
+                COUNT(DISTINCT el.member_name) as ext_members,
+                COALESCE(AVG(el.duration) FILTER (WHERE el.duration > 0), 0) as ext_avg_dur,
+                COALESCE(COUNT(*) FILTER (WHERE el.status = 'completed'), 0) as ext_success,
+                COUNT(*) as ext_total
+            FROM external_logs el
+            JOIN external_teams et ON et.id = el.team_id AND et.is_active = TRUE
+            WHERE el.reported_at >= NOW() - ($1 || ' days')::INTERVAL
+        """, str(days))
+
+    # 合并指标
+    int_tasks = row["total_tasks"] or 0
+    int_tickets = row["total_tickets"] or 0
+    ext_logs = ext["ext_logs"] or 0
+    ext_tickets = ext["ext_tickets"] or 0
+
+    total_tasks = int_tasks + ext_logs
+    total_tickets = int_tickets + ext_tickets
+    unique_users = (row["unique_users"] or 0) + (ext["ext_members"] or 0)
+
+    # 加权平均耗时
+    int_dur = float(row["avg_duration"] or 0)
+    ext_dur = float(ext["ext_avg_dur"] or 0)
+    int_w = int_tickets
+    ext_w = ext_tickets
+    if int_w + ext_w > 0:
+        avg_duration = (int_dur * int_w + ext_dur * ext_w) / (int_w + ext_w)
+    else:
+        avg_duration = 0
+
+    # 加权成功率
+    int_rate = float(row["success_rate"] or 0)
+    int_success_count = int_rate * int_tickets
+    ext_success_count = ext["ext_success"] or 0
+    total_count = int_tickets + (ext["ext_total"] or 0)
+    success_rate = (int_success_count + ext_success_count) / total_count if total_count > 0 else 0
+
+    estimated_hours_saved = total_tickets * 2.0
+
     return OverviewStats(
-        total_tasks=row["total_tasks"],
-        total_tickets=row["total_tickets"],
-        unique_users=row["unique_users"],
-        avg_duration=float(row["avg_duration"]),
-        success_rate=float(row["success_rate"]),
-        estimated_hours_saved=float(row["estimated_hours_saved"]),
+        total_tasks=total_tasks,
+        total_tickets=total_tickets,
+        unique_users=unique_users,
+        avg_duration=avg_duration,
+        success_rate=success_rate,
+        estimated_hours_saved=estimated_hours_saved,
     )
+
 
 
 @router.get("/trends", response_model=list[TrendPoint])

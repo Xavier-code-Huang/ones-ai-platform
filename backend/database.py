@@ -327,12 +327,14 @@ CREATE TABLE IF NOT EXISTS user_code_paths (
 COMMENT ON TABLE user_code_paths IS '用户在每台服务器上使用过的代码目录历史';
 
 -- ============================================================
---  accuracy_evaluations  准确度评测结果表 [FR-200]
+--  accuracy_evaluations  准确度评测结果表 [FR-200, FR-302]
 -- ============================================================
 CREATE TABLE IF NOT EXISTS accuracy_evaluations (
     id              SERIAL PRIMARY KEY,
-    task_ticket_id  INTEGER UNIQUE NOT NULL REFERENCES task_tickets(id) ON DELETE CASCADE,
+    task_ticket_id  INTEGER REFERENCES task_tickets(id) ON DELETE CASCADE,
     ticket_id       VARCHAR(50) NOT NULL,
+    source          VARCHAR(20) DEFAULT 'internal',
+    external_log_id INTEGER REFERENCES external_logs(id) ON DELETE CASCADE,
     gerrit_change_id    VARCHAR(100) DEFAULT '',
     gerrit_change_url   TEXT DEFAULT '',
     gerrit_files        JSONB DEFAULT '[]',
@@ -352,7 +354,7 @@ CREATE TABLE IF NOT EXISTS accuracy_evaluations (
 );
 CREATE INDEX IF NOT EXISTS idx_ae_ticket ON accuracy_evaluations(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ae_effective ON accuracy_evaluations(is_effective);
-COMMENT ON TABLE accuracy_evaluations IS '准确度评测结果：五维度评分 + Gerrit 关联数据';
+COMMENT ON TABLE accuracy_evaluations IS '准确度评测结果：五维度评分 + Gerrit 关联数据（支持内部+外部）';
 """
 
 
@@ -366,6 +368,26 @@ ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS container_name VARCHAR(255) DE
 ALTER TABLE task_tickets ADD COLUMN IF NOT EXISTS conversation_id VARCHAR(255) DEFAULT '';
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS phase_name VARCHAR(50) DEFAULT '';
+
+-- v1.6.0: 外部团队 Patch 统计 [FR-301]
+ALTER TABLE external_logs ADD COLUMN IF NOT EXISTS ai_report TEXT DEFAULT '';
+ALTER TABLE external_logs ADD COLUMN IF NOT EXISTS patch_files JSONB DEFAULT '[]';
+ALTER TABLE external_logs ADD COLUMN IF NOT EXISTS patch_insertions INTEGER DEFAULT 0;
+ALTER TABLE external_logs ADD COLUMN IF NOT EXISTS patch_deletions INTEGER DEFAULT 0;
+
+-- v1.6.0: 准确度评测支持外部数据 [FR-302]
+ALTER TABLE accuracy_evaluations ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'internal';
+ALTER TABLE accuracy_evaluations ADD COLUMN IF NOT EXISTS external_log_id INTEGER;
+DO $$ BEGIN
+  ALTER TABLE accuracy_evaluations ALTER COLUMN task_ticket_id DROP NOT NULL;
+EXCEPTION WHEN others THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE accuracy_evaluations DROP CONSTRAINT IF EXISTS accuracy_evaluations_task_ticket_id_key;
+EXCEPTION WHEN others THEN NULL;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_ae_source ON accuracy_evaluations(source);
+CREATE INDEX IF NOT EXISTS idx_ae_ext_log ON accuracy_evaluations(external_log_id);
 """
 
 
@@ -376,4 +398,4 @@ async def init_db():
         await conn.execute(INIT_SQL)
         # 执行迁移（新增列，兼容已有表）
         await conn.execute(MIGRATION_SQL)
-    logger.info("数据库初始化完成（15 张表 + 迁移）")
+    logger.info("数据库初始化完成（15 张表 + v1.6 迁移）")
