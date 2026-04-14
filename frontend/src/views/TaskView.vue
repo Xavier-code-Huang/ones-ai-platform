@@ -77,6 +77,69 @@
         </div>
       </div>
 
+      <!-- ========== 区块 1.5: AI 引擎 ========== -->
+      <div class="form-section" v-if="multiEngineEnabled">
+        <div class="section-header">
+          <span class="section-icon">🤖</span>
+          <div>
+            <h2 class="section-title">AI 引擎</h2>
+            <p class="section-desc">选择 AI 引擎和模型，GLM 为默认引擎</p>
+          </div>
+        </div>
+
+        <div class="form-grid-3">
+          <!-- Provider 选择 -->
+          <div class="form-field">
+            <label class="field-label">引擎 <span class="required">*</span></label>
+            <el-select v-model="form.engine_type" placeholder="选择引擎" @change="onEngineChange" class="w-full">
+              <el-option v-for="e in engineOptions" :key="e.value" :value="e.value" :label="e.label" />
+            </el-select>
+          </div>
+
+          <!-- 模型选择 -->
+          <div class="form-field">
+            <label class="field-label">模型</label>
+            <el-select
+              v-if="!modelManualMode"
+              v-model="form.model_name"
+              placeholder="选择模型"
+              :loading="modelsLoading"
+              class="w-full"
+            >
+              <el-option v-for="m in currentModels" :key="m.model_id" :value="m.model_id" :label="m.display_name" />
+            </el-select>
+            <el-input
+              v-else
+              v-model="form.model_name"
+              placeholder="手动输入模型名称（如 claude-sonnet-4-20250514）"
+              class="w-full"
+            />
+            <div v-if="modelLoadError" class="field-hint" style="color:var(--danger);">
+              ⚠️ 模型列表加载失败，已切换为手动输入
+            </div>
+          </div>
+
+          <!-- Key 选择器（非 GLM 时展示） -->
+          <div class="form-field" v-if="form.engine_type !== 'glm'">
+            <label class="field-label">API Key <span class="required">*</span></label>
+            <el-select
+              v-if="userKeys.length > 0"
+              v-model="form.api_key_id"
+              placeholder="选择 API Key"
+              :loading="keysLoading"
+              class="w-full"
+            >
+              <el-option v-for="k in userKeys" :key="k.id" :value="k.id"
+                         :label="(k.label ? k.label + ' — ' : '') + k.key_preview" />
+            </el-select>
+            <div v-else-if="!keysLoading" class="no-key-hint">
+              <span>未配置 {{ engineLabel }} 的 API Key</span>
+              <router-link to="/settings/api-keys" class="key-link">前往设置 →</router-link>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- ========== 区块 2: 工单列表 ========== -->
       <div class="form-section">
         <div class="section-header">
@@ -226,6 +289,14 @@
             <span class="preview-label">任务模式</span>
             <el-tag size="small" type="info">{{ form.task_mode }}</el-tag>
           </div>
+          <div class="preview-env-item">
+            <span class="preview-label">AI 引擎</span>
+            <el-tag size="small" type="success">{{ engineLabel }}</el-tag>
+          </div>
+          <div class="preview-env-item">
+            <span class="preview-label">模型</span>
+            <span class="mono">{{ form.model_name || '默认' }}</span>
+          </div>
         </div>
         <el-table :data="previewTickets" border size="small" style="width:100%;margin-top:16px;">
           <el-table-column type="index" label="#" width="50" />
@@ -251,7 +322,7 @@
 <script setup>
 import { ref, reactive, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { RefreshRight, Plus, Close, ArrowRight, ArrowDown } from '@element-plus/icons-vue'
+import { RefreshRight, Plus, Close, ArrowRight } from '@element-plus/icons-vue'
 import api from '../api'
 import { ElMessage } from 'element-plus'
 import CodePathSelect from '../components/CodePathSelect.vue'
@@ -270,6 +341,31 @@ const ticketListRef = ref(null)
 
 // 拖拽状态
 const dragIdx = ref(-1)
+
+// ---- 功能开关 ----
+const multiEngineEnabled = ref(false)
+
+// ---- 引擎/模型/Key 状态 ----
+const engineOptions = [
+  { value: 'glm', label: 'GLM (智谱)' },
+  { value: 'anthropic', label: 'Anthropic Claude' },
+  { value: 'openai', label: 'OpenAI Codex' },
+]
+const modelsLoading = ref(false)
+const modelLoadError = ref(false)
+const modelManualMode = ref(false)
+const currentModels = ref([])
+const keysLoading = ref(false)
+const userKeys = ref([])
+
+// 组件级缓存：同一页面会话内切回同一 Provider 不重复请求
+const modelsCache = reactive({})  // { provider: [models] }
+const keysCache = reactive({})    // { provider: [keys] }
+
+const engineLabel = computed(() => {
+  const opt = engineOptions.find(e => e.value === form.engine_type)
+  return opt ? opt.label : form.engine_type
+})
 
 let _keyCounter = 1
 function genKey() { return _keyCounter++ }
@@ -314,6 +410,9 @@ const form = reactive({
   credential_id: null,
   agent_dir: '',
   task_mode: 'fix',
+  engine_type: 'glm',
+  model_name: '',
+  api_key_id: null,
   tickets: [
     { ticket_id: '', code_directory: '', note: '', extra_mounts: [], _showMounts: false, _key: genKey() }
   ]
@@ -334,11 +433,19 @@ const previewTickets = computed(() =>
 )
 
 onMounted(async () => {
+  // 加载功能开关
+  try {
+    const flags = await api.getFeatureFlags()
+    multiEngineEnabled.value = flags.multi_engine_enabled === true
+  } catch (_) { /* 静默 */ }
+
   servers.value = (await api.getServers()).filter(s => s.has_my_credential)
   if (route.params.serverId) {
     form.server_id = parseInt(route.params.serverId)
     await loadCredentials()
   }
+  // 默认加载 GLM 模型列表
+  await loadModels('glm')
 })
 
 async function loadCredentials() {
@@ -362,6 +469,78 @@ async function loadAgentDir() {
       agentDirLoaded.value = true
     }
   } catch (e) { /* 静默 */ }
+}
+
+// ---- 引擎/模型/Key 逻辑 ----
+async function onEngineChange() {
+  form.model_name = ''
+  form.api_key_id = null
+  modelLoadError.value = false
+  modelManualMode.value = false
+  await loadModels(form.engine_type)
+  if (form.engine_type !== 'glm') {
+    await loadUserKeys(form.engine_type)
+  } else {
+    userKeys.value = []
+  }
+}
+
+async function loadModels(provider) {
+  // 组件级缓存命中
+  if (modelsCache[provider]) {
+    currentModels.value = modelsCache[provider]
+    autoSelectDefaultModel()
+    return
+  }
+  modelsLoading.value = true
+  modelLoadError.value = false
+  modelManualMode.value = false
+  try {
+    const res = await api.getProviderModelsByProvider(provider)
+    const models = res.models || res || []
+    modelsCache[provider] = models
+    currentModels.value = models
+    autoSelectDefaultModel()
+  } catch (e) {
+    modelLoadError.value = true
+    modelManualMode.value = true
+    currentModels.value = []
+  } finally {
+    modelsLoading.value = false
+  }
+}
+
+function autoSelectDefaultModel() {
+  if (currentModels.value.length === 0) return
+  const def = currentModels.value.find(m => m.is_default)
+  form.model_name = def ? def.model_id : currentModels.value[0].model_id
+}
+
+async function loadUserKeys(provider) {
+  // 组件级缓存命中
+  if (keysCache[provider]) {
+    userKeys.value = keysCache[provider]
+    autoSelectDefaultKey()
+    return
+  }
+  keysLoading.value = true
+  try {
+    const keys = await api.listUserKeys(provider)
+    const list = keys.keys || keys || []
+    keysCache[provider] = list
+    userKeys.value = list
+    autoSelectDefaultKey()
+  } catch (e) {
+    userKeys.value = []
+  } finally {
+    keysLoading.value = false
+  }
+}
+
+function autoSelectDefaultKey() {
+  if (userKeys.value.length === 0) { form.api_key_id = null; return }
+  const def = userKeys.value.find(k => k.is_default)
+  form.api_key_id = def ? def.id : userKeys.value[0].id
 }
 
 // ---- 工单操作 ----
@@ -463,6 +642,11 @@ function showPreview() {
   const adErr = validatePath(form.agent_dir)
   if (adErr) return ElMessage.warning('Agent 目录: ' + adErr)
 
+  // 非 GLM 引擎需要选择 API Key
+  if (form.engine_type !== 'glm' && !form.api_key_id) {
+    return ElMessage.warning(`请先配置 ${engineLabel.value} 的 API Key`)
+  }
+
   for (const t of form.tickets) {
     if (t.ticket_id && /[,\s，、;；]/.test(t.ticket_id.trim())) {
       return ElMessage.warning('每行只能填写一个工单号')
@@ -487,6 +671,9 @@ async function submitTask() {
       credential_id: form.credential_id,
       agent_dir: form.agent_dir,
       task_mode: form.task_mode,
+      engine_type: form.engine_type,
+      model_name: form.model_name,
+      ...(form.engine_type !== 'glm' && form.api_key_id ? { api_key_id: form.api_key_id } : {}),
       tickets: previewTickets.value,
     }
     const task = await api.createTask(payload)
@@ -816,5 +1003,26 @@ async function submitTask() {
   .ticket-id-field { width: 100%; }
   .ticket-handle { display: none; }
   .preview-env { grid-template-columns: 1fr; }
+}
+
+/* ===== 引擎/Key 提示 ===== */
+.no-key-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  padding: 8px 12px;
+  background: var(--bg-body);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm, 8px);
+}
+.key-link {
+  color: var(--accent);
+  font-size: 0.78rem;
+  text-decoration: none;
+}
+.key-link:hover {
+  text-decoration: underline;
 }
 </style>

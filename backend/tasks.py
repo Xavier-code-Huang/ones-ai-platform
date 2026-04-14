@@ -33,10 +33,15 @@ class TicketInput(BaseModel):
 
 
 class CreateTaskRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     server_id: int
     credential_id: int
     agent_dir: str
     task_mode: str = "fix"
+    engine_type: str = "glm"          # 新增: Provider 类型 [FR-ME-004]
+    model_name: str = ""              # 新增: 模型名称 [FR-ME-004]
+    api_key_id: Optional[int] = None  # 新增: 用户 API Key ID [FR-ME-004]
     tickets: list[TicketInput]
 
 
@@ -59,6 +64,8 @@ class TicketResult(BaseModel):
 
 
 class TaskInfo(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     id: int
     user_id: int
     user_email: str = ""
@@ -70,6 +77,8 @@ class TaskInfo(BaseModel):
     failed_count: int
     total_duration: float
     task_mode: str = "fix"
+    engine_type: str = "glm"          # 新增 [FR-ME-010]
+    model_name: str = ""              # 新增 [FR-ME-010]
     submitted_at: str
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -121,14 +130,56 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
     validate_path(req.agent_dir, "Agent 目录")
     if req.task_mode not in ("analysis", "fix", "auto"):
         raise HTTPException(400, "task_mode 必须为 analysis/fix/auto")
+
+    # ---- 引擎校验 [FR-ME-004, FR-ME-005] ----
+    VALID_ENGINE_TYPES = ("glm", "anthropic", "openai")
+    if req.engine_type not in VALID_ENGINE_TYPES:
+        raise HTTPException(400, f"engine_type 必须为 {'/'.join(VALID_ENGINE_TYPES)}")
+
+    pool = await get_pool()
+
+    if req.engine_type != "glm":
+        # 多引擎功能开关 + Key 校验（合并为一次连接）
+        async with pool.acquire() as conn:
+            flag = await conn.fetchval(
+                "SELECT config_value FROM external_configs WHERE config_key='multi_engine_enabled'")
+            if flag != "true":
+                raise HTTPException(403, "多引擎功能尚未开放，请联系管理员开启")
+
+            # 非 GLM 引擎需要 api_key_id
+            if not req.api_key_id:
+                raise HTTPException(400, f"{req.engine_type} 引擎需要指定 api_key_id")
+            # 验证 Key 归属当前用户 + Provider 匹配
+            key_row = await conn.fetchrow(
+                "SELECT id, provider FROM user_api_keys WHERE id=$1 AND user_id=$2",
+                req.api_key_id, user.id,
+            )
+            if not key_row:
+                raise HTTPException(400, "API Key 不存在或不属于当前用户")
+            if key_row["provider"] != req.engine_type:
+                raise HTTPException(400, f"API Key 的 Provider ({key_row['provider']}) 与引擎类型 ({req.engine_type}) 不匹配")
+    else:
+        # GLM 模式不需要 api_key_id
+        if req.api_key_id:
+            logger.warning(f"GLM 模式下忽略 api_key_id={req.api_key_id}")
+            req.api_key_id = None
+
+    # model_name 允许自定义（不在 provider_models 表中也放行）
+    if req.model_name:
+        async with pool.acquire() as conn:
+            model_exists = await conn.fetchval(
+                "SELECT 1 FROM provider_models WHERE provider=$1 AND model_id=$2 AND is_active=TRUE",
+                req.engine_type, req.model_name,
+            )
+            if not model_exists:
+                logger.warning(f"自定义模型名: engine={req.engine_type}, model={req.model_name} (不在 provider_models 表中)")
+
     for t in req.tickets:
         if t.code_directory:
             validate_path(t.code_directory, "代码位置")
         for mp in t.extra_mounts:
             if mp:
                 validate_path(mp, "额外挂载路径")
-
-    pool = await get_pool()
 
     # ---- 步骤1: 查凭证（快速 DB 查询，单独获取连接）----
     async with pool.acquire() as conn:
@@ -216,10 +267,12 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
 
         async with conn.transaction():
             task_id = await conn.fetchval("""
-                INSERT INTO tasks (user_id, server_id, credential_id, status, ticket_count, submitted_at, agent_dir, task_mode)
-                VALUES ($1, $2, $3, 'pending', $4, NOW(), $5, $6)
+                INSERT INTO tasks (user_id, server_id, credential_id, status, ticket_count, submitted_at, agent_dir, task_mode,
+                                   engine_type, model_name, api_key_id)
+                VALUES ($1, $2, $3, 'pending', $4, NOW(), $5, $6, $7, $8, $9)
                 RETURNING id
-            """, user.id, req.server_id, req.credential_id, len(req.tickets), req.agent_dir, req.task_mode)
+            """, user.id, req.server_id, req.credential_id, len(req.tickets), req.agent_dir, req.task_mode,
+               req.engine_type, req.model_name, req.api_key_id)
 
             # [FR-111] 14.1 工单级去重：同一任务内不允许重复工单号
             seen_ids = set()
@@ -266,6 +319,8 @@ async def create_task(req: CreateTaskRequest, user: UserInfo = Depends(get_curre
         status=row["status"], ticket_count=row["ticket_count"],
         success_count=row["success_count"], failed_count=row["failed_count"],
         total_duration=row["total_duration"], submitted_at=str(row["submitted_at"]),
+        engine_type=row["engine_type"] or "glm",
+        model_name=row["model_name"] or "",
     )
 
 
@@ -305,6 +360,8 @@ async def list_tasks(
             total_duration=r["total_duration"], submitted_at=str(r["submitted_at"]),
             started_at=str(r["started_at"]) if r["started_at"] else None,
             completed_at=str(r["completed_at"]) if r["completed_at"] else None,
+            engine_type=r["engine_type"] or "glm",
+            model_name=r["model_name"] or "",
         )
         for r in rows
     ]
@@ -469,6 +526,8 @@ async def get_task(task_id: int, user: UserInfo = Depends(get_current_user)):
         total_duration=row["total_duration"], submitted_at=str(row["submitted_at"]),
         started_at=str(row["started_at"]) if row["started_at"] else None,
         completed_at=str(row["completed_at"]) if row["completed_at"] else None,
+        engine_type=row["engine_type"] or "glm",
+        model_name=row["model_name"] or "",
         tickets=ticket_results,
     )
 
@@ -482,6 +541,9 @@ async def cancel_task(task_id: int, user: UserInfo = Depends(get_current_user)):
             "UPDATE tasks SET status='cancelled' WHERE id=$1 AND user_id=$2 AND status='pending'",
             task_id, user.id,
         )
+    # result 格式为 "UPDATE N"，检查受影响行数
+    if result == "UPDATE 0":
+        raise HTTPException(status_code=404, detail="任务不存在或不可取消（仅 pending 状态可取消）")
     return {"success": True}
 
 
@@ -714,8 +776,7 @@ async def get_ticket_container(
     container_name = record["container_name"]
     if not container_name:
         return {"container_name": "", "status": "not_bound"}
-    # 安全校验
-    import re
+    # 安全校验（re 已在模块顶部导入）
     if not re.fullmatch(r'ones-ai-[\w-]+', container_name):
         raise HTTPException(400, "容器名格式异常")
 
@@ -772,7 +833,6 @@ async def start_ticket_container(
     if record["task_status"] == "running":
         raise HTTPException(400, "任务正在自动化执行，禁止挂起或创建干预容器")
 
-    import re
     container_name = record["container_name"] or ""
 
     try:

@@ -17,6 +17,9 @@
           <router-link to="/tasks" class="nav-item" :class="{ active: $route.path === '/tasks' }">
             <el-icon><List /></el-icon> 任务列表
           </router-link>
+          <router-link v-if="multiEngineEnabled" to="/settings/api-keys" class="nav-item" :class="{ active: $route.path === '/settings/api-keys' }">
+            <el-icon><Key /></el-icon> API 密钥
+          </router-link>
           <template v-if="isAdmin">
             <div class="nav-section">管理</div>
             <router-link to="/admin" class="nav-item" :class="{ active: $route.path === '/admin' }">
@@ -76,15 +79,26 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from './stores/auth'
+import api from './api'
 
 const authStore = useAuthStore()
 const router = useRouter()
 const isLoggedIn = computed(() => authStore.isLoggedIn)
 const isAdmin = computed(() => authStore.isAdmin)
 const user = computed(() => authStore.user)
+const multiEngineEnabled = ref(false)
+
+onMounted(async () => {
+  if (authStore.isLoggedIn) {
+    try {
+      const flags = await api.getFeatureFlags()
+      multiEngineEnabled.value = flags.multi_engine_enabled === true
+    } catch (_) { /* 静默 */ }
+  }
+})
 
 function logout() {
   authStore.logout()

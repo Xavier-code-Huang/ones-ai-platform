@@ -34,12 +34,25 @@ async def get_ssh_connection(
     username: str,
     password: str,
 ) -> asyncssh.SSHClientConnection:
-    """获取或创建 SSH 连接"""
+    """获取或创建 SSH 连接（带缓存健康检查）"""
     key = _make_key(host, port, username)
     async with _lock:
         conn = _connections.get(key)
         if conn and _is_alive(conn):
-            return conn
+            # 缓存命中 — 做 echo 健康检查确认连接真正可用
+            try:
+                result = await asyncio.wait_for(conn.run("echo ok"), timeout=5)
+                if result.stdout.strip() == "ok":
+                    return conn
+            except Exception:
+                pass
+            # 健康检查失败，移除死连接
+            logger.warning(f"SSH 缓存连接健康检查失败，重建: {username}@{host}:{port}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _connections.pop(key, None)
 
         # 创建新连接
         try:

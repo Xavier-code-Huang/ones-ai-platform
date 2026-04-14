@@ -6,6 +6,7 @@ const routes = [
   { path: '/tasks', name: 'TaskList', component: () => import('../views/TaskListView.vue'), meta: { auth: true } },
   { path: '/tasks/new/:serverId?', name: 'NewTask', component: () => import('../views/TaskView.vue'), meta: { auth: true } },
   { path: '/tasks/:id', name: 'TaskDetail', component: () => import('../views/TaskDetailView.vue'), meta: { auth: true } },
+  { path: '/settings/api-keys', name: 'ApiKeys', component: () => import('../views/ApiKeysView.vue'), meta: { auth: true } },
   { path: '/admin', name: 'Admin', component: () => import('../views/AdminView.vue'), meta: { auth: true, admin: true } },
   { path: '/admin/trends', name: 'AdminTrend', component: () => import('../views/AdminTrend.vue'), meta: { auth: true, admin: true } },
   { path: '/admin/users', name: 'AdminUsers', component: () => import('../views/AdminUsers.vue'), meta: { auth: true, admin: true } },

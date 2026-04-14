@@ -41,6 +41,12 @@
             <span class="task-id">#{{ t.id }}</span>
             <span class="task-server">{{ t.server_name }}</span>
             <span :class="'badge badge-' + statusColor(t.status)">{{ statusLabel(t.status) }}</span>
+            <span v-if="t.engine_type && t.engine_type !== 'glm'" class="engine-tag">
+              🤖 {{ engineLabel(t.engine_type, t.model_name) }}
+            </span>
+            <span v-else-if="t.engine_type === 'glm' && t.model_name" class="engine-tag engine-tag-glm">
+              {{ t.model_name }}
+            </span>
           </div>
           <div class="task-row-right">
             <span class="task-stats">
@@ -86,6 +92,12 @@ const pageSize = 20
 const total = ref(0)
 
 const modeLabels = { fix: '🔧 修复', analysis: '🔍 分析', auto: '🤖 自动' }
+const engineNames = { anthropic: 'Anthropic', openai: 'OpenAI' }
+
+function engineLabel(engineType, modelName) {
+  const name = engineNames[engineType] || engineType
+  return modelName ? `${name} · ${modelName}` : name
+}
 
 function statusColor(s) {
   return { pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info'
@@ -166,4 +178,20 @@ onMounted(loadTasks)
 }
 .empty-icon { font-size: 3rem; margin-bottom: 12px; opacity: 0.6; }
 .empty-state p { font-size: 1rem; color: var(--text-secondary); margin-bottom: 4px; }
+
+/* 引擎标签 */
+.engine-tag {
+  font-size: 0.75rem;
+  padding: 2px 10px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(168, 85, 247, 0.1));
+  color: #7c3aed;
+  border: 1px solid rgba(139, 92, 246, 0.2);
+  white-space: nowrap;
+}
+.engine-tag-glm {
+  background: var(--glass-bg);
+  color: var(--text-muted);
+  border-color: var(--glass-border);
+}
 </style>

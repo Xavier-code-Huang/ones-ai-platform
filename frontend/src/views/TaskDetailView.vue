@@ -8,7 +8,15 @@
         </el-button>
         <div>
           <h1>任务 <span class="task-id-highlight">#{{ task.id }}</span></h1>
-          <p class="detail-sub">{{ task.server_name }} · {{ task.submitted_at?.substring(0,16) }}</p>
+          <p class="detail-sub">
+            {{ task.server_name }} · {{ task.submitted_at?.substring(0,16) }}
+            <span v-if="task.engine_type && task.engine_type !== 'glm'" class="engine-info">
+              · 🤖 {{ engineLabel(task.engine_type, task.model_name) }}
+            </span>
+            <span v-else-if="task.engine_type === 'glm'" class="engine-info engine-info-glm">
+              · GLM{{ task.model_name ? ' · ' + task.model_name : '' }}
+            </span>
+          </p>
         </div>
       </div>
       <span :class="'status-pill status-' + task.status">
@@ -508,6 +516,12 @@ function renderMd(text) {
   try { return marked.parse(safe) || safe } catch { return safe }
 }
 
+const engineNames = { anthropic: 'Anthropic', openai: 'OpenAI' }
+function engineLabel(engineType, modelName) {
+  const name = engineNames[engineType] || engineType
+  return modelName ? `${name} · ${modelName}` : name
+}
+
 async function loadTask() {
   const data = await api.getTask(route.params.id)
   // 保留已展开的折叠状态（防止 WS progress 刷新导致折叠）
@@ -690,6 +704,16 @@ onUnmounted(() => {
 .detail-header h1 { font-size: 1.5rem; font-weight: 700; }
 .task-id-highlight { color: var(--accent-light); font-family: var(--font-mono); }
 .detail-sub { color: var(--text-secondary); font-size: 0.88rem; margin-top: 2px; }
+
+/* 引擎信息 */
+.engine-info {
+  color: #7c3aed;
+  font-weight: 500;
+}
+.engine-info-glm {
+  color: var(--text-muted);
+  font-weight: 400;
+}
 
 /* 状态胶囊 */
 .status-pill {

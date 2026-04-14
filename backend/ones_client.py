@@ -102,27 +102,3 @@ async def query_tickets(numbers: list[int]) -> list[dict]:
         return []
 
 
-async def send_task_message(task_uuid: str, html_content: str) -> bool:
-    """
-    通过 ONES API 网关向工单发送消息 [FR-009]
-
-    Args:
-        task_uuid: 工单 UUID
-        html_content: HTML 格式消息内容
-    """
-    url = f"{settings.ONES_API_GATEWAY}/api/ones/v3/ones/task/message/send"
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=15) as client:
-            resp = await client.post(
-                url,
-                json={"taskUuid": task_uuid, "text": html_content},
-                headers={"Content-Type": "application/json"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("data", {}).get("success", False)
-            return False
-    except Exception as e:
-        logger.warning(f"发送工单消息失败: {e}")
-        return False

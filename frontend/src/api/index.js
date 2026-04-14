@@ -75,4 +75,16 @@ export default {
   getAccuracySummary: () => api.get('/accuracy/summary'),
   getAccuracyTickets: (page, pageSize, effectiveOnly) => api.get('/accuracy/tickets', { params: { page, page_size: pageSize, effective_only: effectiveOnly || undefined } }),
   batchAccuracyEval: (limit) => api.post('/accuracy/batch', null, { params: { limit }, timeout: 600000 }),
+  // User API Keys
+  listUserKeys: (provider) => api.get('/user/keys', { params: provider ? { provider } : {} }),
+  addUserKey: (data) => api.post('/user/keys', data),
+  updateUserKey: (keyId, data) => api.put(`/user/keys/${keyId}`, data),
+  deleteUserKey: (keyId) => api.delete(`/user/keys/${keyId}`),
+  validateUserKey: (keyId) => api.post(`/user/keys/${keyId}/validate`),
+  validateUserKeyDirect: (data) => api.post('/user/keys/validate-direct', data),
+  // Provider Models
+  getProviderModels: () => api.get('/providers/models'),
+  getProviderModelsByProvider: (provider) => api.get(`/providers/${provider}/models`),
+  // Feature Flags
+  getFeatureFlags: () => api.get('/feature-flags'),
 }

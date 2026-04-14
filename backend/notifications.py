@@ -239,7 +239,7 @@ async def _send_email_notification(task: dict, ticket_results: list) -> bool:
     msg.attach(MIMEText(html, "html", "utf-8"))
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _smtp_send, msg, to_email)
         logger.info(f"邮件通知发送成功 (task={task['id']}, to={to_email})")
         return True
@@ -269,10 +269,12 @@ async def send_task_notification(task_id: int):
     任务完成后发送通知 [FR-009]
 
     多通道并发发送，任一失败不影响其他，绝不阻塞调用方。
+    注意：网络发送前释放 DB 连接，避免连接池耗尽。
     """
     pool = await get_pool()
+
+    # ① 查询数据（短生命周期连接）
     async with pool.acquire() as conn:
-        # 查询任务信息
         task = await conn.fetchrow("""
             SELECT t.*, u.ones_email, u.display_name
             FROM tasks t JOIN users u ON u.id = t.user_id
@@ -283,7 +285,6 @@ async def send_task_notification(task_id: int):
 
         task = dict(task)
 
-        # 查询工单处理结果
         rows = await conn.fetch("""
             SELECT ticket_id, code_directory, status,
                    result_summary as summary, error_message,
@@ -293,14 +294,15 @@ async def send_task_notification(task_id: int):
         """, task_id)
         ticket_results = [dict(r) for r in rows]
 
-        # 并发发送所有启用的通道
-        results = await asyncio.gather(
-            _send_webhook_notification(task, ticket_results),
-            _send_email_notification(task, ticket_results),
-            return_exceptions=True,
-        )
+    # ② 并发发送所有启用的通道（此时无 DB 连接占用）
+    results = await asyncio.gather(
+        _send_webhook_notification(task, ticket_results),
+        _send_email_notification(task, ticket_results),
+        return_exceptions=True,
+    )
 
-        # 记录通知结果
+    # ③ 写入通知结果（重新获取连接）
+    async with pool.acquire() as conn:
         channels = ["webhook", "email"]
         for ch, result in zip(channels, results):
             if isinstance(result, Exception):

@@ -78,6 +78,24 @@
       </el-form>
     </div>
 
+    <!-- 功能开关 -->
+    <div class="config-group glass-card fade-in-up">
+      <div class="config-group-header">
+        <span class="config-group-icon" style="background:linear-gradient(135deg, rgba(99,102,241,0.15), rgba(168,85,247,0.15));color:#7c3aed;">🤖</span>
+        <div>
+          <h3>功能开关</h3>
+          <span class="config-group-desc">平台功能模块的启用/禁用控制</span>
+        </div>
+      </div>
+      <el-form label-width="140px">
+        <el-form-item label="多引擎支持">
+          <el-switch v-model="multiEngineEnabled" active-text="启用" inactive-text="关闭"
+                     @change="v => configs.multi_engine_enabled = v ? 'true' : 'false'" />
+          <span class="switch-hint">允许用户使用 Anthropic / OpenAI 引擎（需用户自行配置 API Key）</span>
+        </el-form-item>
+      </el-form>
+    </div>
+
     <!-- SMTP 邮件服务器 -->
     <div class="config-group glass-card fade-in-up" v-if="emailEnabled">
       <div class="config-group-header">
@@ -114,12 +132,14 @@ const configs = reactive({})
 const saving = ref(false)
 const webhookEnabled = ref(false)
 const emailEnabled = ref(false)
+const multiEngineEnabled = ref(false)
 
 onMounted(async () => {
   const list = await api.getConfigs()
   list.forEach(c => { configs[c.config_key] = c.config_value })
   webhookEnabled.value = configs.notify_webhook_enabled === 'true'
   emailEnabled.value = configs.notify_email_enabled === 'true'
+  multiEngineEnabled.value = configs.multi_engine_enabled === 'true'
 })
 
 async function save() {

@@ -11,9 +11,10 @@ import asyncio
 import logging
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
+from auth import get_current_user, UserInfo
 from config import settings
 from database import init_db, close_pool, get_pool
 from task_executor import task_worker
@@ -87,6 +88,8 @@ from external import router as external_router
 from ones_preview import router as preview_router
 from terminal_ws import router as terminal_router
 from accuracy_api import router as accuracy_router
+from user_keys import router as user_keys_router
+from providers import router as providers_router
 
 app.include_router(auth_router)
 app.include_router(servers_router)
@@ -98,6 +101,8 @@ app.include_router(external_router)
 app.include_router(preview_router)
 app.include_router(terminal_router)
 app.include_router(accuracy_router)
+app.include_router(user_keys_router)
+app.include_router(providers_router)
 
 
 @app.get("/")
@@ -108,6 +113,16 @@ async def root():
         "version": settings.APP_VERSION,
         "status": "running",
     }
+
+
+@app.get("/api/feature-flags")
+async def feature_flags(user: UserInfo = Depends(get_current_user)):
+    """功能开关接口（需登录）"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT config_value FROM external_configs WHERE config_key='multi_engine_enabled'")
+    return {"multi_engine_enabled": row and row["config_value"] == "true"}
 
 
 @app.get("/api/health")
@@ -152,6 +167,8 @@ async def _init_default_configs():
         # 通知开关
         ("notify_webhook_enabled", str(settings.NOTIFY_WEBHOOK_ENABLED).lower(), False, "Webhook 通知开关"),
         ("notify_email_enabled", str(settings.NOTIFY_EMAIL_ENABLED).lower(), False, "邮件通知开关"),
+        # 功能开关
+        ("multi_engine_enabled", "false", False, "多引擎支持开关（Anthropic/OpenAI）"),
         # SMTP
         ("smtp_host", settings.SMTP_HOST, False, "SMTP 服务器地址"),
         ("smtp_port", str(settings.SMTP_PORT), False, "SMTP 端口"),

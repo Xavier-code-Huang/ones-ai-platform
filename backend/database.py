@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS users (
     ones_email      VARCHAR(255) UNIQUE NOT NULL,
     display_name    VARCHAR(255) DEFAULT '',
     role            VARCHAR(20) DEFAULT 'user',
+    password_hash   TEXT DEFAULT '',
     is_active       BOOLEAN DEFAULT TRUE,
     last_login_at   TIMESTAMP,
     created_at      TIMESTAMP DEFAULT NOW(),
@@ -145,8 +146,6 @@ CREATE TABLE IF NOT EXISTS task_tickets (
     code_directory  TEXT DEFAULT '',
     container_name  VARCHAR(255) DEFAULT '',
     extra_mounts    TEXT DEFAULT '',
-    compile_command TEXT DEFAULT '',
-    run_tests       BOOLEAN DEFAULT FALSE,
     status          VARCHAR(20) DEFAULT 'pending',
     result_summary  TEXT DEFAULT '',
     result_report   TEXT DEFAULT '',
@@ -355,6 +354,55 @@ CREATE TABLE IF NOT EXISTS accuracy_evaluations (
 CREATE INDEX IF NOT EXISTS idx_ae_ticket ON accuracy_evaluations(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ae_effective ON accuracy_evaluations(is_effective);
 COMMENT ON TABLE accuracy_evaluations IS '准确度评测结果：五维度评分 + Gerrit 关联数据（支持内部+外部）';
+
+-- ============================================================
+--  user_api_keys  用户 API Key 表 [FR-ME-002]
+-- ============================================================
+CREATE TABLE IF NOT EXISTS user_api_keys (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider        VARCHAR(20) NOT NULL,   -- 'anthropic', 'openai'
+    api_key_encrypted TEXT NOT NULL,         -- AES-256-GCM 加密（复用 crypto.py）
+    key_suffix      VARCHAR(10) DEFAULT '', -- 明文后4位，用于前端展示辨识
+    label           VARCHAR(100) DEFAULT '', -- 用户自定义别名
+    is_default      BOOLEAN DEFAULT FALSE,  -- 该 Provider 下的默认 Key
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_uak_user ON user_api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_uak_provider ON user_api_keys(user_id, provider);
+COMMENT ON TABLE user_api_keys IS '用户 API Key 加密存储，各用户隔离';
+
+-- ============================================================
+--  provider_models  Provider 可用模型配置表 [FR-ME-003, FR-ME-009]
+-- ============================================================
+CREATE TABLE IF NOT EXISTS provider_models (
+    id              SERIAL PRIMARY KEY,
+    provider        VARCHAR(20) NOT NULL,
+    model_id        VARCHAR(100) NOT NULL,
+    display_name    VARCHAR(100) NOT NULL,
+    description     TEXT DEFAULT '',
+    is_default      BOOLEAN DEFAULT FALSE,
+    is_active       BOOLEAN DEFAULT TRUE,
+    sort_order      INTEGER DEFAULT 0,
+    source          VARCHAR(20) DEFAULT 'manual',
+    discovered_at   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(provider, model_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pm_provider ON provider_models(provider);
+COMMENT ON TABLE provider_models IS 'Provider 可用模型配置，支持管理员手动维护 + 动态发现';
+
+-- ============================================================
+--  GLM 初始模型数据
+-- ============================================================
+INSERT INTO provider_models (provider, model_id, display_name, is_default, sort_order, source)
+VALUES
+  ('glm', 'glm-5',   'GLM-5 (默认)',   TRUE,  10, 'manual'),
+  ('glm', 'glm-5.1', 'GLM-5.1',        FALSE, 20, 'manual'),
+  ('glm', 'glm-4.7', 'GLM-4.7 (Lite)', FALSE, 30, 'manual')
+ON CONFLICT DO NOTHING;
 """
 
 
@@ -388,6 +436,17 @@ EXCEPTION WHEN others THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_ae_source ON accuracy_evaluations(source);
 CREATE INDEX IF NOT EXISTS idx_ae_ext_log ON accuracy_evaluations(external_log_id);
+
+-- v1.7.0: 多引擎支持 [FR-ME-005]
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS engine_type VARCHAR(20) DEFAULT 'glm';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS model_name VARCHAR(100) DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS api_key_id INTEGER REFERENCES user_api_keys(id) ON DELETE SET NULL;
+
+-- v1.7.1: 补充 password_hash 列（auth.py 登录缓存用）
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT DEFAULT '';
+
+-- v1.7.1: 清理废弃列（compile_command / run_tests 从未使用）
+-- 注意：不做 DROP COLUMN，仅在 INIT_SQL 中移除，避免破坏已有数据
 """
 
 
@@ -398,4 +457,4 @@ async def init_db():
         await conn.execute(INIT_SQL)
         # 执行迁移（新增列，兼容已有表）
         await conn.execute(MIGRATION_SQL)
-    logger.info("数据库初始化完成（15 张表 + v1.6 迁移）")
+    logger.info("数据库初始化完成（17 张表 + v1.6/v1.7 迁移）")

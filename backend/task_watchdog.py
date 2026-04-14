@@ -36,8 +36,8 @@ async def _cleanup_orphan_tickets():
             SELECT tt.id, tt.ticket_id, tt.task_id, tt.started_at
             FROM task_tickets tt
             WHERE tt.status = 'running'
-              AND tt.started_at < NOW() - INTERVAL '%s hours'
-        """ % TICKET_MAX_RUNNING)
+              AND tt.started_at < NOW() - $1 * INTERVAL '1 hour'
+        """, TICKET_MAX_RUNNING)
 
         if orphaned:
             logger.warning(f"Watchdog: 发现 {len(orphaned)} 个超时 running 工单")
@@ -78,8 +78,8 @@ async def _cleanup_orphan_tasks():
         orphaned = await conn.fetch("""
             SELECT id FROM tasks
             WHERE status = 'running'
-              AND started_at < NOW() - INTERVAL '%s hours'
-        """ % TASK_MAX_RUNNING)
+              AND started_at < NOW() - $1 * INTERVAL '1 hour'
+        """, TASK_MAX_RUNNING)
 
         if orphaned:
             logger.warning(f"Watchdog: 发现 {len(orphaned)} 个超时 running 任务")

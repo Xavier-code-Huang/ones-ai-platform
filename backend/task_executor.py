@@ -11,6 +11,7 @@
 import asyncio
 import json
 import logging
+import re
 import shlex
 import time
 from datetime import datetime, timezone
@@ -97,12 +98,17 @@ async def _save_log(task_id: int, content: str, log_type: str = "stdout",
 
 def _build_remote_command(tickets: list[dict], agent_dir: str = "",
                           extra_mounts: list[str] = None,
-                          task_mode: str = "fix") -> str:
+                          task_mode: str = "fix",
+                          engine_type: str = "glm",
+                          model_name: str = "") -> str:
     """构建发送到远程服务器的 ones-AI 命令
 
     通过 ones-AI 脚本执行（走 Docker 容器），和命令行方式完全一致，
     避免宿主机 Python 版本、依赖等环境不一致问题。
     工作目录设为用户家目录（每个用户的 process/ 日志隔离）。
+
+    [FR-ME-006] 新增 engine_type/model_name 参数，生成 --engine/--model CLI 参数。
+    GLM 为默认引擎，不传 --engine（向后兼容）。
     """
     # ones-AI 已安装在 PATH 中（如 /usr/local/bin/ones-AI）
     cmd_parts = ["ones-AI", "--json-output", "--tickets"]
@@ -135,6 +141,12 @@ def _build_remote_command(tickets: list[dict], agent_dir: str = "",
     # 添加任务模式
     if task_mode:
         cmd_parts.extend(["--task-mode", task_mode])
+
+    # [FR-ME-006] 引擎和模型参数（GLM 为默认，不传 --engine 保持向后兼容）
+    if engine_type and engine_type != "glm":
+        cmd_parts.extend(["--engine", engine_type])
+    if model_name:
+        cmd_parts.extend(["--model", model_name])
 
     cmd = " ".join(shlex.quote(p) for p in cmd_parts)
 
@@ -263,6 +275,21 @@ async def _execute_task(task_id: int):
         agent_dir = task.get("agent_dir") or ""
         task_mode = task.get("task_mode") or "fix"
 
+        # [FR-ME-006] 从 task 记录读取引擎信息
+        engine_type = task.get("engine_type") or "glm"
+        model_name = task.get("model_name") or ""
+        api_key_id = task.get("api_key_id")
+
+        # [FR-ME-006] 解密用户 Key（仅非 GLM 引擎需要）
+        # GLM 模式 Key 由 ones-AI.sh 内部从网关获取，不注入 ONESAI_API_KEY
+        user_api_key = ""
+        if api_key_id:
+            async with pool.acquire() as conn:
+                key_row = await conn.fetchrow(
+                    "SELECT api_key_encrypted FROM user_api_keys WHERE id=$1", api_key_id)
+                if key_row:
+                    user_api_key = decrypt_password(key_row["api_key_encrypted"])
+
         for idx, ticket in enumerate(tickets):
             db_id = ticket["id"]
             ticket_id_str = ticket["ticket_id"]
@@ -283,7 +310,16 @@ async def _execute_task(task_id: int):
             extra_mounts = [m.strip() for m in extra_mounts_str.split(',') if m.strip()] if extra_mounts_str else None
             command = _build_remote_command(single_data, agent_dir=agent_dir,
                                             extra_mounts=extra_mounts,
-                                            task_mode=task_mode)
+                                            task_mode=task_mode,
+                                            engine_type=engine_type,
+                                            model_name=model_name)
+
+            # [FR-ME-006] Key 注入前缀（仅非 GLM 引擎）
+            # GLM 模式不注入 ONESAI_API_KEY — Key 由 ones-AI.sh 内部从网关获取
+            # Key 通过环境变量注入，不作为命令行参数（避免 ps 泄露）
+            if user_api_key:
+                command = f"export ONESAI_API_KEY='{user_api_key}' && {command}"
+
             await _save_log(task_id, f"执行命令: {command}", "system")
 
             # 标记工单为 running，清空旧容器信息（避免终端连到旧的干预容器）
@@ -374,8 +410,7 @@ async def _execute_task(task_id: int):
                     #   "正在进入容器: ones-ai-xxx-123"
                     # 容器名格式固定: ones-ai-{用户名}-{PID数字}
                     if not container_name and "ones-ai-" in line:
-                        import re as _re
-                        _m = _re.search(r'\bones-ai-\w+-\d+\b', line)
+                        _m = re.search(r'\bones-ai-\w+-\d+\b', line)
                         if _m:
                             container_name = _m.group(0)
                             logger.info(f"捕获容器名: {container_name}")
