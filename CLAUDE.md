@@ -110,7 +110,17 @@ sudo docker-compose -f /opt/ones-ai-platform/docker-compose.yml up -d --force-re
 #       后者端口映射模式 → backend 连不上 127.0.0.1:9627 的 postgres
 ```
 
-**平台访问地址**：http://172.60.1.35:9600
+**平台访问地址**：http://172.60.1.35:9621
+
+#### ⚠️ Workbench 已独立到 `F:\X-workbench\`
+
+Workbench（新主站，9630 端口）**不在本仓库**，已搬到独立仓库 `F:\X-workbench\`，
+有自己的 backend / frontend / database / deploy / docs 五个目录。
+
+- 访问：http://172.60.1.35:9630/
+- 仓库：`F:\X-workbench\`，改动看 `F:\X-workbench\CLAUDE.md`
+- 容器：`onesai-workbench`，目录 `/opt/ones-ai-workbench/`（和 ones-AI 主站完全隔离）
+- **在本仓库禁止**把 workbench 路由 / DDL / 模块重新注入回 `backend/` 或 `frontend/`
 
 ### 2. 部署 CLI 工具（ones-ai-deploy）
 
@@ -152,10 +162,13 @@ bash pack.sh
 
 | 服务 | 地址 | 说明 |
 |------|------|------|
-| ones-AI 平台 | http://172.60.1.35:9600 | Web 管理界面 |
+| ones-AI 任务系统 | http://172.60.1.35:9621 | 本仓库对应的平台 |
+| Workbench（独立仓库） | http://172.60.1.35:9630 | 见 `F:\X-workbench\` — 本仓库不包含其代码 |
 | 部署器 | http://172.60.1.35:9680 | lango-AI / ones-AI 部署工具 |
 | API Key 网关 | http://172.60.1.35:9601 | Claude API Key 分发 |
 | SSH | 172.60.1.35 | 用户: ops |
+
+**端口全貌**：见 `doc/ports-35.md`（新开服务前必读，避免碰撞）。
 
 ## 核心架构
 

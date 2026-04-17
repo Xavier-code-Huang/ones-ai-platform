@@ -447,6 +447,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT DEFAULT '';
 
 -- v1.7.1: 清理废弃列（compile_command / run_tests 从未使用）
 -- 注意：不做 DROP COLUMN，仅在 INIT_SQL 中移除，避免破坏已有数据
+-- （workbench_* 表由 backend/workbench/ 独立服务自行迁移，不在此处执行）
 """
 
 
