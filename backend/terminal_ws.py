@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import base64
 import json
 import logging
 
@@ -106,25 +107,34 @@ async def terminal_ws(websocket: WebSocket, ticket_db_id: int,
         is_intervene = "intervene" in container_name
         if is_intervene:
             saved_conv_id = (record.get("conversation_id") or "").strip()
-            # 预检: session 文件必须存在才能 resume, 否则当"首次干预"处理
-            # (session 存放位置: 容器内 $HOME/.claude/projects/*/<sessionId>.jsonl)
-            if saved_conv_id:
-                check = await ssh_conn.run(
-                    f"docker exec {container_name} bash -c "
-                    f"'ls $HOME/.claude/projects/*/{saved_conv_id}.jsonl 2>/dev/null | head -1'"
-                )
-                if not check.stdout.strip():
-                    logger.info(f"conversation_id {saved_conv_id} 对应 session 不存在, 走首次干预路径")
-                    saved_conv_id = ""
 
             if saved_conv_id:
-                # 后续干预: resume 上次会话
-                # claude CLI 的 resume 语法是 `claude --resume <sessionId>` (位置参数, 不是 --conversation-id)
-                # 用 exec 让 claude 替换 bash 进程 — 否则 claude 作为 bash 子进程,
-                # docker exec -it 分配的 TTY 前台控制权留在 bash 那里, claude 拿不到键盘输入
-                cmd = (f"docker exec -it {container_name} bash -c "
-                       f"'echo \"🔧 恢复干预会话: {saved_conv_id}\" && "
-                       f"exec claude --resume {saved_conv_id}'")
+                # 后续干预: resume 上次会话, 带 fallback 到裸 claude
+                # 为什么不用 `bash -c 'exec claude --resume X'`:
+                #   claude 可能因为 project-hash 不匹配等内部原因报 "No conversation found",
+                #   一退出 WS 就断了, 用户体验差. 我们需要失败时自动降级到新 claude.
+                # 为什么不用 `bash -c 'claude --resume X || claude'` (不带 exec):
+                #   non-interactive bash (-c 模式) 下, claude 子进程拿不到 TTY 前台 -> 无法输入.
+                # 走 auto_resume.sh 同款路径: 把脚本写进容器, bash --rcfile 启动 (interactive 模式).
+                # 这条路径首次干预已证明可用 —— claude 能正常接收键盘输入.
+                script = (
+                    f'#!/bin/bash\n'
+                    f'echo "🔧 恢复干预会话: {saved_conv_id}"\n'
+                    f'claude --resume {saved_conv_id}\n'
+                    f'RC=$?\n'
+                    f'if [ $RC -ne 0 ]; then\n'
+                    f'  echo ""\n'
+                    f'  echo "⚠️ 无法恢复会话 (可能已过期或工作目录变化), 已为你启动新会话..."\n'
+                    f'  echo ""\n'
+                    f'  claude\n'
+                    f'fi\n'
+                )
+                b64 = base64.b64encode(script.encode('utf-8')).decode('ascii')
+                await ssh_conn.run(
+                    f"docker exec {container_name} bash -c "
+                    f"'echo {b64} | base64 -d > /tmp/smart_resume.sh && chmod +x /tmp/smart_resume.sh'"
+                )
+                cmd = f"docker exec -it {container_name} bash --rcfile /tmp/smart_resume.sh"
             else:
                 # 首次干预：用 auto_resume.sh
                 has_resume = await ssh_conn.run(
