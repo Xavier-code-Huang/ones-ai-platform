@@ -108,9 +108,12 @@ async def terminal_ws(websocket: WebSocket, ticket_db_id: int,
             saved_conv_id = (record.get("conversation_id") or "").strip()
             if saved_conv_id:
                 # 后续干预：resume 上次会话
+                # 关键：用 `exec` 让 claude 直接替换 bash 进程 —— 否则 claude 作为 bash 子进程，
+                # docker exec -it 分配的 TTY 前台控制权被 bash 占着，claude 拿不到键盘输入。
+                # 若 resume 失败（会话已失效），claude 会自行退出，WS 断开，用户可在前端点重连。
                 cmd = (f"docker exec -it {container_name} bash -c "
                        f"'echo \"🔧 恢复干预会话: {saved_conv_id}\" && "
-                       f"claude --resume --conversation-id {saved_conv_id} 2>/dev/null || claude'")
+                       f"exec claude --resume --conversation-id {saved_conv_id}'")
             else:
                 # 首次干预：用 auto_resume.sh
                 has_resume = await ssh_conn.run(
