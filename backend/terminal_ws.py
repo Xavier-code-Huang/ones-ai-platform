@@ -106,14 +106,25 @@ async def terminal_ws(websocket: WebSocket, ticket_db_id: int,
         is_intervene = "intervene" in container_name
         if is_intervene:
             saved_conv_id = (record.get("conversation_id") or "").strip()
+            # 预检: session 文件必须存在才能 resume, 否则当"首次干预"处理
+            # (session 存放位置: 容器内 $HOME/.claude/projects/*/<sessionId>.jsonl)
             if saved_conv_id:
-                # 后续干预：resume 上次会话
-                # 关键：用 `exec` 让 claude 直接替换 bash 进程 —— 否则 claude 作为 bash 子进程，
-                # docker exec -it 分配的 TTY 前台控制权被 bash 占着，claude 拿不到键盘输入。
-                # 若 resume 失败（会话已失效），claude 会自行退出，WS 断开，用户可在前端点重连。
+                check = await ssh_conn.run(
+                    f"docker exec {container_name} bash -c "
+                    f"'ls $HOME/.claude/projects/*/{saved_conv_id}.jsonl 2>/dev/null | head -1'"
+                )
+                if not check.stdout.strip():
+                    logger.info(f"conversation_id {saved_conv_id} 对应 session 不存在, 走首次干预路径")
+                    saved_conv_id = ""
+
+            if saved_conv_id:
+                # 后续干预: resume 上次会话
+                # claude CLI 的 resume 语法是 `claude --resume <sessionId>` (位置参数, 不是 --conversation-id)
+                # 用 exec 让 claude 替换 bash 进程 — 否则 claude 作为 bash 子进程,
+                # docker exec -it 分配的 TTY 前台控制权留在 bash 那里, claude 拿不到键盘输入
                 cmd = (f"docker exec -it {container_name} bash -c "
                        f"'echo \"🔧 恢复干预会话: {saved_conv_id}\" && "
-                       f"exec claude --resume --conversation-id {saved_conv_id}'")
+                       f"exec claude --resume {saved_conv_id}'")
             else:
                 # 首次干预：用 auto_resume.sh
                 has_resume = await ssh_conn.run(
