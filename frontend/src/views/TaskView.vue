@@ -62,14 +62,18 @@
         <!-- Agent 目录 -->
         <div class="form-field" style="margin-top:16px;">
           <label class="field-label">Agent-Teams 目录 <span class="required">*</span></label>
-          <el-input v-model="form.agent_dir" placeholder="如 /home/disk3/user/Lango-Agent-Teams"
-                    :class="{'input-error': submitted && !form.agent_dir}">
-            <template #append v-if="agentDirMemory">
-              <el-tooltip content="重置为记忆目录">
-                <el-button @click="form.agent_dir = agentDirMemory" :icon="RefreshRight" />
-              </el-tooltip>
-            </template>
-          </el-input>
+          <div class="agent-dir-wrap">
+            <el-input v-model="form.agent_dir" placeholder="如 /home/disk3/user/Lango-Agent-Teams"
+                      :class="{'input-error': submitted && !form.agent_dir}" />
+            <el-tooltip v-if="agentDirMemory" content="重置为上次记忆的目录" placement="top">
+              <button type="button" class="agent-dir-reset"
+                      @click="form.agent_dir = agentDirMemory"
+                      aria-label="重置">
+                <el-icon><RefreshRight /></el-icon>
+                <span>重置</span>
+              </button>
+            </el-tooltip>
+          </div>
           <div v-if="agentDirError" class="path-error">{{ agentDirError }}</div>
           <div v-if="agentDirLoaded" class="field-hint" style="color:var(--success);">
             ✅ 已自动读取上次目录
@@ -1024,5 +1028,54 @@ async function submitTask() {
 }
 .key-link:hover {
   text-decoration: underline;
+}
+
+/* ===== Agent-Teams 目录 + 重置按钮 ===== */
+.agent-dir-wrap {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+.agent-dir-wrap :deep(.el-input) {
+  flex: 1;
+}
+.agent-dir-reset {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 14px;
+  height: 32px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm, 8px);
+  cursor: pointer;
+  transition: all 0.18s ease;
+  outline: none;
+  box-shadow: var(--shadow-xs, 0 1px 2px rgba(0,0,0,0.04));
+}
+.agent-dir-reset:hover {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm, 0 2px 6px rgba(51,65,85,0.18));
+}
+.agent-dir-reset:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+.agent-dir-reset:focus-visible {
+  box-shadow: 0 0 0 3px rgba(51, 65, 85, 0.18);
+}
+.agent-dir-reset .el-icon {
+  font-size: 14px;
+  transition: transform 0.3s ease;
+}
+.agent-dir-reset:hover .el-icon {
+  transform: rotate(-90deg);
 }
 </style>

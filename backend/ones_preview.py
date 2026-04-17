@@ -107,11 +107,28 @@ async def _call_ai(user_prompt: str) -> dict:
             resp = await client.post(url, json=body, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
-                # Anthropic 格式: content[0].text
+                # Anthropic 兼容格式: content 是 block 列表，可能包含 thinking / text / tool_use
+                # GLM 在开启思维链时 content[0] 可能是 thinking block，必须遍历找 text block
                 text = ""
                 content = data.get("content", [])
                 if content and isinstance(content, list):
-                    text = content[0].get("text", "")
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "text" and block.get("text"):
+                            text = block.get("text", "")
+                            break
+                    # 兼容旧格式: 没有 type 字段时回退到第一个有 text 的 block
+                    if not text:
+                        for block in content:
+                            if isinstance(block, dict) and block.get("text"):
+                                text = block.get("text", "")
+                                break
+
+                if not text:
+                    logger.warning(f"AI 返回内容为空: content={str(content)[:300]}")
+                    return {"type": "", "prompt": ""}
 
                 # 尝试解析 JSON
                 # 去掉可能的 markdown 代码块
@@ -130,7 +147,8 @@ async def _call_ai(user_prompt: str) -> dict:
                     }
                 except json.JSONDecodeError:
                     # AI 未返回有效 JSON，将原始文本作为提示词
-                    return {"type": "分析", "prompt": text[:500]}
+                    logger.info(f"AI 返回非 JSON 格式，回退为纯文本提示词: {text[:100]}")
+                    return {"type": "分析", "prompt": text[:2000]}
             else:
                 logger.warning(f"AI 调用失败: HTTP {resp.status_code} - {resp.text[:200]}")
                 return {"type": "", "prompt": ""}
@@ -279,14 +297,17 @@ async def preview_tickets(
             user_prompt += f"\n\n代码路径: {t.code_directory}"
 
         ai_result = await _call_ai(user_prompt)
+        suggested_prompt = ai_result.get("prompt", "")
+        preview_error = "" if suggested_prompt else "AI 暂未生成提示词，请检查 AI 网关状态或重试"
 
         results.append(PreviewResult(
             ticket_id=tid,
             title=title,
             description=desc[:500],
             problem_type=ai_result.get("type", ""),
-            suggested_prompt=ai_result.get("prompt", ""),
+            suggested_prompt=suggested_prompt,
             suggested_agent=ai_result.get("agent", ""),
+            error=preview_error,
         ))
 
     return results

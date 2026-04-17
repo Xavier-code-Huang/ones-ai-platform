@@ -43,16 +43,72 @@ Ones-AI专项开发/
 
 ### 1. 部署 Web 平台（ones-ai-platform）
 
-平台直接部署到 172.60.1.35，不经过部署器：
+平台直接部署到 172.60.1.35，不经过部署器。**两种模式，视改动类型选择**：
+
+#### 1a. 热补丁（`deploy_full.py`）— 日常开发首选
 
 ```bash
 python deploy_full.py
 ```
 
 该脚本会：
-- `npm run build` 构建前端
-- SCP 上传到 35 服务器的 `/opt/onesai-platform/`
-- 重启 `onesai-backend` 和 nginx
+- SCP 后端 .py 文件到 `/opt/ones-ai-platform/backend/` + `docker cp` 进运行中的容器
+- 若有 `frontend/dist` 则同步前端 + `docker restart onesai-backend`
+
+⚠️ **只更新容器里的文件，不更新镜像**。一旦遇到 `docker-compose up --force-recreate`，
+容器回退到镜像快照 → 手工补的文件 / 依赖全部丢失。
+
+**适用改动**：已有后端 .py 文件的改动（bug fix、逻辑调整）。
+
+#### 1b. 全量重建（`deploy_rebuild.py`）— 依赖 / 新模块变更必选
+
+```bash
+# 需先启动 Docker Desktop（或 WSL docker daemon）
+python deploy_rebuild.py            # dry-run: 只本地 build + save，不推送
+python deploy_rebuild.py --push     # 真实上线：本地 build → save → scp → 35 load → recreate
+```
+
+产出的 `ones-ai-backend:latest` 镜像与 `backend/` 源码 **1:1 对应**，`--force-recreate`
+再也不会丢文件。
+
+**必须走这条的场景**：
+- `requirements.txt` 新增/移除 Python 依赖
+- `Dockerfile` 有改动
+- 新增后端模块（例如 v1.7 的 `user_keys.py` / `providers.py`）
+- 想抹掉手工 `docker cp` 导致的镜像漂移
+
+#### 历史教训（勿再重复）
+
+- 🔥 **v1.7 引入 `user_keys.py` / `providers.py` 和 `aiohttp` 依赖时只用了热补丁**，
+  镜像从未 rebuild。后来 `docker-compose up --force-recreate` 直接崩溃
+  （`ModuleNotFoundError: user_keys` + `aiohttp 缺失`），平台挂掉约 30 分钟。
+  教训：**新增文件 / 改依赖 → 一定走 `deploy_rebuild.py --push`**。
+
+- 🔥 **`deploy_full.py` 的 `backend_files` 列表必须跟源码一起维护**。新增 .py 模块后
+  记得把文件名加进去，否则 SCP 时会漏。目前已有 `user_keys.py` / `providers.py`。
+
+- 🔥 **35 服务器连不上 Docker Hub**（`registry-1.docker.io` connection reset）。
+  所以 `docker-compose build` 在 35 上跑不动 —— 本地 build → save/scp/load 是标配路径。
+
+#### 排障命令速查
+
+```bash
+# SSH 登 35
+ssh ops@172.60.1.35   # 密码在 deploy_full.py 顶部
+
+# 看 backend 状态 / 日志
+sudo docker ps | grep onesai
+sudo docker logs onesai-backend --tail 30
+
+# 看容器环境变量（如 AI_API_KEY）
+sudo docker exec onesai-backend printenv | grep AI_API_KEY
+
+# API Key 在 /opt/ones-ai-platform/.env 里，改完要 recreate 才生效：
+sudo docker-compose -f /opt/ones-ai-platform/docker-compose.yml up -d --force-recreate --no-deps backend
+
+# 注意：必须用 docker-compose.yml（network_mode: host），不是 docker-compose.prod.yml
+#       后者端口映射模式 → backend 连不上 127.0.0.1:9627 的 postgres
+```
 
 **平台访问地址**：http://172.60.1.35:9600
 
